@@ -455,7 +455,7 @@ cmd_push() {
 }
 
 cmd_pull() {
-  local sid="$1" remote_file remote_dir remote_name local_name local_dir local_file cmp
+  local sid="$1" remote_file remote_dir remote_name local_name local_dir local_file cmp pre post pre_rc post_rc
   require_remote
   remote_file="$(find_remote_session "$sid")"
   remote_dir="$(dirname "$remote_file")"
@@ -487,10 +487,26 @@ cmd_pull() {
   # locally first (best-effort; warns instead of blocking on failure).
   backup_local_before_force "$sid" "$local_file"
   mkdir -p "$local_dir" || return $?
+  # Liveness check (M5): snapshot the REMOTE source's mtime+size around the
+  # transfer, mirroring cmd_push's local pre/post snapshot — if the remote
+  # file changed while rsync ran, a Claude is likely still writing it there
+  # and the pulled bytes may be a torn (mid-write) snapshot. Advisory only:
+  # it WARNS and never fails, consistent with push. Skipped when either
+  # snapshot is unavailable (transport error, empty, or MISSING) so a flaky
+  # ssh can't false-alarm. Costs two extra remote stat round trips.
+  pre_rc=0; post_rc=0
+  pre="$(remote_stat "$remote_file")" || pre_rc=$?
   # -I/--ignore-times: see the matching comment in cmd_push — skip rsync's
   # size+mtime quick-check so an already-adjudicated transfer always sends
   # the bytes, even when source and destination share size and mtime.
   rsync -aI --progress "$REMOTE:$remote_file" "$local_file" || return $?
+  post="$(remote_stat "$remote_file")" || post_rc=$?
+  if [ "$pre_rc" -eq 0 ] && [ "$post_rc" -eq 0 ] \
+    && [ -n "$pre" ] && [ -n "$post" ] \
+    && [ "$pre" != "MISSING" ] && [ "$post" != "MISSING" ] \
+    && [ "$pre" != "$post" ]; then
+    log "WARNING: the remote session file changed during transfer — a Claude is likely still writing it there; the pulled copy may be an incomplete snapshot. Stop it and re-run pull."
+  fi
   if [ "$cmp" = "equal" ]; then
     log "already in sync: $sid (no transfer needed)"
   else
@@ -1483,6 +1499,10 @@ done
 rsync_ver=$(rsync --version 2>/dev/null | head -1)
 if [ -n "$rsync_ver" ]; then echo "     remote rsync: $rsync_ver"; fi
 if command -v tmux >/dev/null 2>&1; then echo "ok   remote tmux present"; else echo "warn remote tmux missing"; fi
+for t in pgrep ps awk; do
+  if command -v "$t" >/dev/null 2>&1; then echo "ok   remote $t present"; else echo "warn remote $t missing — handoff cannot locate/stop the remote session without it"; fi
+done
+if command -v claude >/dev/null 2>&1; then echo "ok   remote claude present"; else echo "warn remote claude missing — handoff cannot restart the session on the remote without it"; fi
 if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
   echo "ok   remote jq or python3 present (JSONL cwd resolution)"
 else

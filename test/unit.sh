@@ -974,6 +974,10 @@ BKP1="$PROJECTS/$LHP-code-p1"; mkdir -p "$BKP1"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 BKRSYNC="$TMP/bk_rsync"; : > "$BKRSYNC"
 rsync() { printf '%s\n' "$*" >> "$BKRSYNC"; }
+# cmd_pull's liveness check (M5) stats the remote source around the transfer;
+# stub remote_stat so these pulls stay hermetic (no real ssh to host "stub").
+# MISSING means "nothing to compare", so the liveness warning is skipped.
+remote_stat() { printf 'MISSING'; }
 
 # -- 1. pull --force over an existing local dest: stash the OLD bytes into a
 # -- timestamped file under roam-backups, prune stale stashes, still rsync.
@@ -1072,7 +1076,120 @@ case "$(cat "$BKPLOG")" in
   *)              t_ok   "backup: remote-missing push issues no backup command" ;;
 esac
 assert_match "backup: remote-missing push still rsyncs" "bk4.jsonl" "$(cat "$BKRSYNC")"
-unset -f require_remote find_remote_session compare_mtimes rsync remote_sh
+unset -f require_remote find_remote_session compare_mtimes rsync remote_sh remote_stat
 FORCE=0
+
+# ---- M5 + M6a: pull-side liveness warning + doctor handoff-tool checks ----
+# The prior block unset -f'd the real find_remote_session/compare_mtimes/
+# remote_sh/rsync/require_remote -- re-source to restore the genuine
+# cmd_pull/cmd_doctor/remote_stat before layering test-local stubs on top.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+
+# -- M5: cmd_pull snapshots the REMOTE source's mtime+size around the rsync
+# -- (mirroring cmd_push's local pre/post snapshot) and WARNS -- without
+# -- failing -- when the remote file changed mid-transfer: a Claude is likely
+# -- still writing it there, so the pulled copy may be a torn snapshot.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-p1/m5a.jsonl"; }
+compare_mtimes() { printf 'remote-newer'; }
+remote_sh() { :; }
+rsync() { :; }
+# Keep the shrink guard from consuming a remote_stat call of its own, so the
+# stubs below see exactly the two liveness snapshots (pre + post).
+_remote_size_or_empty() { printf ''; }
+FORCE=0
+M5_STAT_CALLS="$TMP/m5_stat_calls"
+
+# 1. source mutated mid-transfer: 2nd stat differs -> WARN, still exit 0.
+: > "$M5_STAT_CALLS"
+remote_stat() {
+  echo x >> "$M5_STAT_CALLS"
+  if [ "$(grep -c x "$M5_STAT_CALLS")" -ge 2 ]; then printf '200 9999'; else printf '100 5555'; fi
+}
+rc=0; out="$( (cmd_pull m5a) 2>&1 )" || rc=$?
+assert_rc "M5: pull with a mutating remote source still succeeds" 0 "$rc"
+assert_match "M5: pull warns when the remote source changed during transfer" "changed during transfer" "$out"
+assert_match "M5: the liveness warning is advisory (WARNING, not error)" "WARNING" "$out"
+
+# 2. stable source: identical stats -> no warning, exactly pre+post calls.
+: > "$M5_STAT_CALLS"
+remote_stat() { echo x >> "$M5_STAT_CALLS"; printf '100 5555'; }
+rc=0; out="$( (cmd_pull m5a) 2>&1 )" || rc=$?
+assert_rc "M5: pull with a stable remote source succeeds" 0 "$rc"
+case "$out" in
+  *"changed during transfer"*) t_fail "M5: no warning when the remote source is stable" "output: $out" ;;
+  *)                           t_ok   "M5: no warning when the remote source is stable" ;;
+esac
+assert_eq "M5: pull stats the remote source before and after (2 calls)" "2" "$(grep -c x "$M5_STAT_CALLS")"
+
+# 3. transport-degraded stats must not false-alarm: remote_stat erroring out
+# (nonzero, per its contract) skips the check and never fails the pull.
+remote_stat() { return 7; }
+rc=0; out="$( (cmd_pull m5a) 2>&1 )" || rc=$?
+assert_rc "M5: pull succeeds when the liveness stats error out" 0 "$rc"
+case "$out" in
+  *"changed during transfer"*) t_fail "M5: no warning when the liveness stats error out" "output: $out" ;;
+  *)                           t_ok   "M5: no warning when the liveness stats error out" ;;
+esac
+
+# 4. a MISSING sentinel on either side is "nothing to compare", not a change
+# (even though the two snapshots differ textually).
+: > "$M5_STAT_CALLS"
+remote_stat() {
+  echo x >> "$M5_STAT_CALLS"
+  if [ "$(grep -c x "$M5_STAT_CALLS")" -ge 2 ]; then printf '100 5555'; else printf 'MISSING'; fi
+}
+rc=0; out="$( (cmd_pull m5a) 2>&1 )" || rc=$?
+assert_rc "M5: pull succeeds when a liveness stat reports MISSING" 0 "$rc"
+case "$out" in
+  *"changed during transfer"*) t_fail "M5: MISSING snapshot does not trigger the warning" "output: $out" ;;
+  *)                           t_ok   "M5: MISSING snapshot does not trigger the warning" ;;
+esac
+unset -f remote_stat _remote_size_or_empty rsync remote_sh compare_mtimes find_remote_session require_remote
+
+# -- M6a: doctor's remote section checks the tools handoff needs -- pgrep/ps/
+# -- awk for pane discovery and the claude binary for restart -- as WARNs
+# -- (advisory: they only affect handoff/handback, never push/pull/sync).
+# Same stubbing approach as the Task 12 doctor tests: stub remote_sh output.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE="stubhost"
+
+# 1. the remote script doctor ships must actually probe the handoff tools.
+M6_SCRIPT="$TMP/m6_script"; : > "$M6_SCRIPT"
+remote_sh() { printf '%s' "$1" > "$M6_SCRIPT"; }
+rc=0; (cmd_doctor) >/dev/null 2>&1 || rc=$?
+assert_rc "M6a: doctor exits 0 with an empty remote report" 0 "$rc"
+assert_match "M6a: doctor's remote script probes pgrep/ps/awk" "pgrep ps awk" "$(cat "$M6_SCRIPT")"
+assert_match "M6a: doctor's remote script probes the claude binary" "command -v claude" "$(cat "$M6_SCRIPT")"
+
+# 2. a remote missing the handoff tools warns but must NOT fail doctor
+# (warn lines must not increment the FAIL counter the local side parses).
+remote_sh() { printf '%s\n' \
+  'ok   remote rsync present' \
+  'warn remote pgrep missing — handoff cannot locate/stop the remote session without it' \
+  'warn remote claude missing — handoff cannot restart the session on the remote without it'; }
+rc=0; out="$(cmd_doctor 2>&1)" || rc=$?
+assert_rc "M6a: doctor exits 0 when remote handoff tools are only warned" 0 "$rc"
+assert_match "M6a: doctor surfaces the pgrep warn line" "warn remote pgrep missing" "$out"
+assert_match "M6a: doctor surfaces the claude warn line" "warn remote claude missing" "$out"
+assert_match "M6a: doctor still reports overall success despite the warns" "all checks passed" "$out"
+
+# 3. all remote handoff tools present -> no handoff warns in the report.
+remote_sh() { printf '%s\n' \
+  'ok   remote pgrep present' \
+  'ok   remote ps present' \
+  'ok   remote awk present' \
+  'ok   remote claude present'; }
+rc=0; out="$(cmd_doctor 2>&1)" || rc=$?
+assert_rc "M6a: doctor exits 0 when remote handoff tools are present" 0 "$rc"
+case "$out" in
+  *"warn remote pgrep missing"*|*"warn remote claude missing"*)
+    t_fail "M6a: no handoff warns when the remote tools are present" "output: $out" ;;
+  *) t_ok "M6a: no handoff warns when the remote tools are present" ;;
+esac
+unset -f remote_sh require_remote
+REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
 
 t_summary
