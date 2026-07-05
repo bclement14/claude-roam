@@ -22,6 +22,16 @@ one without `--force`. But it is only a heuristic — the real fix is
 procedural: stop the session on one side (`handoff`/`handback` already do
 this for you) before resuming it on the other.
 
+## `--force` stashes the clobbered copy first
+
+A `--force` overwrite is the one destructive operation in the tool. Before
+it replaces an existing destination file, that file is copied to
+`~/.claude/roam-backups/<sid>.<timestamp>.jsonl` on the side being
+overwritten — locally for `pull --force`, on the remote for `push --force`
+— so the losing copy is always recoverable. Backups older than 30 days are
+pruned automatically. The stash is best-effort: if it fails you get a
+warning, but the forced transfer still proceeds.
+
 ## Clock skew between machines
 
 The `local-newer`/`remote-newer` verdict compares the two machines' clocks

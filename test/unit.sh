@@ -955,4 +955,124 @@ assert_eq "D3 handback neither stopped nor pulled after the refusal" "" "$(cat "
 unset -f require_remote find_remote_session find_remote_pane compare_mtimes \
   stop_remote_claude cmd_pull remote_sh
 
+# ---- backup before --force overwrite ----
+# A --force overwrite is the tool's only destructive operation. Before it
+# replaces an EXISTING destination file, the losing copy must be stashed to
+# ~/.claude/roam-backups/<sid>.<UTC-timestamp>.jsonl on the machine that
+# holds it (local for pull, remote for push), and stashes older than 30
+# days pruned. No stash on a normal transfer or when the destination is
+# missing (nothing to lose). Prior blocks unset -f'd real functions;
+# re-source first. HOME is the harness's temp dir, so the real
+# ~/.claude/roam-backups is never touched.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+LHP="$(encode_path "$HOME")"
+BKD="$HOME/.claude/roam-backups"
+BKP1="$PROJECTS/$LHP-code-p1"; mkdir -p "$BKP1"
+
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+BKRSYNC="$TMP/bk_rsync"; : > "$BKRSYNC"
+rsync() { printf '%s\n' "$*" >> "$BKRSYNC"; }
+
+# -- 1. pull --force over an existing local dest: stash the OLD bytes into a
+# -- timestamped file under roam-backups, prune stale stashes, still rsync.
+printf 'OLD-LOCAL-BYTES' > "$BKP1/bk1.jsonl"
+rm -rf "$BKD"; mkdir -p "$BKD"
+printf 'stale' > "$BKD/stale.jsonl"
+bk_stale_ts="$(date -v-40d +%Y%m%d%H%M 2>/dev/null || date -d '40 days ago' +%Y%m%d%H%M)"
+touch -t "$bk_stale_ts" "$BKD/stale.jsonl"
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-p1/bk1.jsonl"; }
+compare_mtimes() { printf 'remote-newer'; }
+FORCE=1
+rc=0; out="$( (cmd_pull bk1) 2>&1 )" || rc=$?
+assert_rc "backup: forced pull over existing local dest succeeds" 0 "$rc"
+assert_match "backup: forced pull reports the local stash" "backed up prior local copy" "$out"
+bk_file=""
+for f in "$BKD"/bk1.*.jsonl; do if [ -f "$f" ]; then bk_file="$f"; fi; done
+if [ -n "$bk_file" ]; then
+  t_ok "backup: stash file created under roam-backups"
+else
+  t_fail "backup: stash file created under roam-backups" "no bk1.*.jsonl in $BKD"
+fi
+case "${bk_file##*/}" in
+  bk1.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.jsonl)
+    t_ok "backup: stash name is sid + UTC timestamp" ;;
+  *) t_fail "backup: stash name is sid + UTC timestamp" "got: [${bk_file##*/}]" ;;
+esac
+assert_eq "backup: stash preserves the OLD bytes" "OLD-LOCAL-BYTES" "$(cat "$bk_file" 2>/dev/null)"
+assert_match "backup: the pull rsync still ran" "bk1.jsonl" "$(cat "$BKRSYNC")"
+if [ -f "$BKD/stale.jsonl" ]; then
+  t_fail "backup: stash older than 30 days is pruned" "stale.jsonl survived"
+else
+  t_ok "backup: stash older than 30 days is pruned"
+fi
+
+# -- 2. pull WITHOUT --force: no stash is created (guard on FORCE).
+FORCE=0
+rm -rf "$BKD"; : > "$BKRSYNC"
+_remote_size_or_empty() { printf ''; }   # shrink guard runs when FORCE=0
+rc=0; (cmd_pull bk1) >/dev/null 2>&1 || rc=$?
+assert_rc "backup: non-force pull still succeeds" 0 "$rc"
+if [ -d "$BKD" ]; then
+  t_fail "backup: non-force pull creates no stash" "roam-backups appeared: $(ls "$BKD" 2>/dev/null)"
+else
+  t_ok "backup: non-force pull creates no stash"
+fi
+unset -f _remote_size_or_empty
+
+# -- 3. pull --force with NO existing local dest: nothing to lose, no stash
+# -- attempted, no error, transfer still runs.
+FORCE=1
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-p1/bk3.jsonl"; }
+compare_mtimes() { printf 'local-missing'; }
+rm -rf "$BKD"; : > "$BKRSYNC"
+rc=0; out="$( (cmd_pull bk3) 2>&1 )" || rc=$?
+assert_rc "backup: forced pull with no local dest succeeds" 0 "$rc"
+case "$out" in
+  *"backed up"*) t_fail "backup: local-missing pull attempts no stash" "output: $out" ;;
+  *)             t_ok   "backup: local-missing pull attempts no stash" ;;
+esac
+if [ -d "$BKD" ]; then
+  t_fail "backup: local-missing pull creates no stash dir" "roam-backups appeared"
+else
+  t_ok "backup: local-missing pull creates no stash dir"
+fi
+assert_match "backup: local-missing pull still rsyncs" "bk3.jsonl" "$(cat "$BKRSYNC")"
+
+# -- 4. push --force over an existing remote dest: the backup command goes to
+# -- the remote (mkdir + cp with a timestamped path, as quoted argv), push
+# -- proceeds.
+printf '{"type":"x"}\n' > "$BKP1/bk4.jsonl"
+compare_mtimes() { printf 'remote-newer'; }
+BKPLOG="$TMP/bk_push_remote"; : > "$BKPLOG"
+remote_sh() { { printf 'CALL:'; printf ' [%s]' "$@"; printf '\n'; } >> "$BKPLOG"; }
+: > "$BKRSYNC"
+FORCE=1
+rc=0; out="$( (cmd_push bk4) 2>&1 )" || rc=$?
+assert_rc "backup: forced push over existing remote dest succeeds" 0 "$rc"
+assert_match "backup: forced push reports the remote stash" "backed up prior remote copy" "$out"
+assert_match "backup: remote backup targets the remote roam-backups dir" "/home/alice/.claude/roam-backups" "$(cat "$BKPLOG")"
+assert_match "backup: remote backup script copies the old file" "cp " "$(cat "$BKPLOG")"
+if grep -E 'bk4\.[0-9]{8}T[0-9]{6}Z\.jsonl' "$BKPLOG" >/dev/null; then
+  t_ok "backup: remote stash path is sid + UTC timestamp"
+else
+  t_fail "backup: remote stash path is sid + UTC timestamp" "no timestamped bk4 arg in remote_sh log"
+fi
+assert_match "backup: the push rsync still ran" "bk4.jsonl" "$(cat "$BKRSYNC")"
+
+# -- 5. push --force with the remote dest missing: no backup command issued
+# -- (the mkdir-for-transfer call still runs; it must not mention backups).
+compare_mtimes() { printf 'remote-missing'; }
+: > "$BKPLOG"; : > "$BKRSYNC"
+rc=0; out="$( (cmd_push bk4) 2>&1 )" || rc=$?
+assert_rc "backup: forced push with remote dest missing succeeds" 0 "$rc"
+case "$(cat "$BKPLOG")" in
+  *roam-backups*) t_fail "backup: remote-missing push issues no backup command" "remote_sh log: $(cat "$BKPLOG")" ;;
+  *)              t_ok   "backup: remote-missing push issues no backup command" ;;
+esac
+assert_match "backup: remote-missing push still rsyncs" "bk4.jsonl" "$(cat "$BKRSYNC")"
+unset -f require_remote find_remote_session compare_mtimes rsync remote_sh
+FORCE=0
+
 t_summary

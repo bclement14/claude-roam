@@ -331,6 +331,64 @@ refuse_if_dest_shrinks() {
   fi
 }
 
+# ---- force-overwrite backup ----
+
+# A --force overwrite is the one destructive operation in the tool: it
+# clobbers the destination copy. Before that happens to an EXISTING file,
+# stash the losing copy to ~/.claude/roam-backups/<sid>.<UTC-timestamp>.jsonl
+# on the machine that holds it (local for pull, remote for push), so it is
+# always recoverable; then prune stashes older than 30 days. Best-effort by
+# design: the user asked to force, so a failed backup WARNS but never blocks
+# the overwrite, and a pruning failure never fails the transfer. Nothing is
+# stashed on a normal (non-force) transfer or when the destination is
+# missing (nothing to lose).
+
+_backup_filename() { printf '%s.%s.jsonl' "$1" "$(date -u +%Y%m%dT%H%M%SZ)"; }
+
+# pull --force: the destination being overwritten is the LOCAL file ($2).
+backup_local_before_force() {
+  local sid="$1" dest="$2" bdir backup
+  [ "${FORCE:-0}" -eq 1 ] || return 0
+  [ -f "$dest" ] || return 0
+  bdir="$HOME/.claude/roam-backups"
+  backup="$bdir/$(_backup_filename "$sid")"
+  if mkdir -p "$bdir" 2>/dev/null && cp "$dest" "$backup" 2>/dev/null; then
+    log "backed up prior local copy -> $backup"
+  else
+    log "WARNING: could not back up $dest to $backup — the forced overwrite proceeds WITHOUT a backup"
+  fi
+  find "$bdir" -name '*.jsonl' -type f -mtime +30 -delete 2>/dev/null || true
+  return 0
+}
+
+# push --force: the destination is the REMOTE file ($2); stash it on the
+# remote in one round trip (existence already adjudicated: $3 is cmd_push's
+# compare_mtimes verdict, and remote-missing means nothing to back up).
+# Both paths travel as quoted argv via remote_sh, never interpolated.
+backup_remote_before_force() {
+  local sid="$1" rfile="$2" cmp="$3" bdir backup
+  [ "${FORCE:-0}" -eq 1 ] || return 0
+  [ "$cmp" != "remote-missing" ] || return 0
+  bdir="$RHOME/.claude/roam-backups"
+  backup="$bdir/$(_backup_filename "$sid")"
+  # rfile already passed cmd_push's validate_path; backup adds only $RHOME
+  # plus sid/timestamp characters. Re-check both anyway — in a subshell,
+  # downgrading a refusal to a warning, because a skipped backup must not
+  # abort the forced transfer the user asked for.
+  if ! ( validate_path "$rfile" && validate_path "$backup" ) >/dev/null 2>&1; then
+    log "WARNING: backup path failed validation ($backup) — the forced overwrite proceeds WITHOUT a backup"
+    return 0
+  fi
+  if remote_sh 'mkdir -p "$2" && cp "$1" "$3" || exit 1
+find "$2" -name "*.jsonl" -type f -mtime +30 -delete 2>/dev/null || true
+exit 0' "$rfile" "$bdir" "$backup"; then
+    log "backed up prior remote copy -> $REMOTE:$backup"
+  else
+    log "WARNING: could not back up $REMOTE:$rfile to $backup — the forced overwrite proceeds WITHOUT a backup"
+  fi
+  return 0
+}
+
 # ---- push / pull ----
 
 cmd_push() {
@@ -374,6 +432,9 @@ cmd_push() {
   if [ "$FORCE" -ne 1 ]; then
     refuse_if_dest_shrinks "$(local_size "$local_file")" "$(_remote_size_or_empty "$remote_file")"
   fi
+  # Forced overwrite of an existing remote copy: stash the losing copy on
+  # the remote first (best-effort; warns instead of blocking on failure).
+  backup_remote_before_force "$sid" "$remote_file" "$cmp"
 
   pre="$(local_mtime "$local_file") $(local_size "$local_file")"
   remote_sh 'mkdir -p "$1"' "$remote_dir" || return $?
@@ -422,6 +483,9 @@ cmd_pull() {
     [ -f "$local_file" ] && dest_size="$(local_size "$local_file")"
     refuse_if_dest_shrinks "$(_remote_size_or_empty "$remote_file")" "$dest_size"
   fi
+  # Forced overwrite of an existing local copy: stash the losing copy
+  # locally first (best-effort; warns instead of blocking on failure).
+  backup_local_before_force "$sid" "$local_file"
   mkdir -p "$local_dir" || return $?
   # -I/--ignore-times: see the matching comment in cmd_push — skip rsync's
   # size+mtime quick-check so an already-adjudicated transfer always sends
