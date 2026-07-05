@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091,SC2016,SC2034,SC2218,SC2329
+# shellcheck disable=SC1091,SC2016,SC2034,SC2218,SC2317,SC2329
 # SC1091: Not following sourced file — intentional, harness is relative
 # SC2016: Expressions don't expand — FALSE POSITIVE in remote_sh() stubs
 # SC2034: Appears unused — FALSE POSITIVE, test fixtures used via indirect calls
 # SC2218: Function only defined later — FALSE POSITIVE, test stubs shadow sourced function
+# SC2317: Command appears unreachable — FALSE POSITIVE, mock functions redefined intentionally
 # SC2329: Function never invoked — FALSE POSITIVE, mock functions called indirectly
 # Unit tests for bin/claude-roam. No network: ssh/rsync are stubbed as functions.
 set -u
