@@ -305,11 +305,18 @@ directly." Do not try to construct a reverse SSH workaround.
 transferring:
 
 ```text
-state : local-newer | remote-newer | equal | local-missing | remote-missing
+state : local-newer | remote-newer | equal | diverged | local-missing | remote-missing | remote-unknown
 ```
 
 - `push` refuses if `remote-newer` → tell user to pull first.
 - `pull` refuses if `local-newer` → tell user to push first.
+- either refuses if `diverged` (mtime tie, different size) → user picks a
+  side and re-runs with `--force`.
+- either refuses if `remote-unknown` (ssh/stat to the remote failed) →
+  it's a connectivity problem, not a conflict; check the link and retry.
+- either refuses if the transfer would overwrite a **larger** file with a
+  smaller one (the size-shrink guard: a clock-skew or fork signal) →
+  `--force` overrides once the user confirms which side wins.
 
 This is **advisory** locking, not real locking.
 

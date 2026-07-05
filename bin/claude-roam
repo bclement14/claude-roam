@@ -204,13 +204,18 @@ $matches"
 }
 
 find_remote_session() {
-  local sid="$1" path
-  path="$(remote_sh 'find "$1" -maxdepth 2 -name "$2.jsonl" -print -quit 2>/dev/null' \
+  local sid="$1" matches count
+  matches="$(remote_sh 'find "$1" -maxdepth 2 -name "$2.jsonl" 2>/dev/null' \
     "$RPROJECTS" "$sid" || true)"
-  if [ -z "$path" ]; then
+  if [ -z "$matches" ]; then
     die "session $sid not found on remote $REMOTE under $RPROJECTS"
   fi
-  printf '%s' "$path"
+  count="$(printf '%s\n' "$matches" | grep -c .)"
+  if [ "$count" -gt 1 ]; then
+    die "ambiguous session id $sid on remote $REMOTE — multiple matches:
+$matches"
+  fi
+  printf '%s' "$matches"
 }
 
 # GNU first: BSD stat errors on -c (clean fallback), but GNU stat "succeeds"
@@ -218,26 +223,38 @@ find_remote_session() {
 local_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
 local_size()  { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
 
-# One round trip: "<mtime> <size>" or empty if the file doesn't exist.
+# One round trip. Prints one of:
+#   "MISSING"         remote file genuinely absent (ssh/stat succeeded)
+#   "<mtime> <size>"  remote file present
+# Returns nonzero (no "|| true" swallow) when the ssh/remote script itself
+# fails -- callers MUST check the exit code, not just the (possibly empty)
+# output, so a transport failure is never mistaken for "file missing".
 remote_stat() {
   remote_sh 'f="$1"
-m=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null) || exit 0
-[ -n "$m" ] || exit 0
+m=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null) || { printf "MISSING"; exit 0; }
+[ -n "$m" ] || { printf "MISSING"; exit 0; }
 s=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null)
-printf "%s %s" "$m" "$s"' "$1" || true
+printf "%s %s" "$m" "$s"' "$1"
 }
 
-# local-newer | remote-newer | equal | diverged | local-missing | remote-missing
+# local-newer | remote-newer | equal | diverged | local-missing | remote-missing | remote-unknown
 compare_mtimes() {
-  local lf="$1" rf="$2" lt ls rstat rt rs
+  local lf="$1" rf="$2" lt ls rstat rc=0 rt rs
   if [ ! -f "$lf" ]; then
     printf 'local-missing'
     return
   fi
   lt="$(local_mtime "$lf")"
   ls="$(local_size "$lf")"
-  rstat="$(remote_stat "$rf")"
-  if [ -z "$rstat" ]; then
+  rstat="$(remote_stat "$rf")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # ssh/stat itself failed -- we genuinely don't know the remote state.
+    # NOT remote-missing: that would let push/pull proceed as if the
+    # remote copy doesn't exist, which is the permissive (overwrite) branch.
+    printf 'remote-unknown'
+    return
+  fi
+  if [ -z "$rstat" ] || [ "$rstat" = "MISSING" ]; then
     printf 'remote-missing'
     return
   fi
@@ -251,6 +268,38 @@ compare_mtimes() {
     printf 'equal'
   else
     printf 'diverged'
+  fi
+}
+
+# Best-effort remote file size for the size-shrink guard below: prints the
+# byte count, or empty if the file is missing/unknown (ssh failed). Empty
+# means "nothing to compare against" to the guard, i.e. it skips rather
+# than refuses -- the remote-unknown/remote-missing state machine above is
+# what's responsible for refusing when we can't read the other side at all.
+_remote_size_or_empty() {
+  local rstat rc=0
+  rstat="$(remote_stat "$1")" || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$rstat" ] || [ "$rstat" = "MISSING" ]; then
+    printf ''
+  else
+    printf '%s' "${rstat#* }"
+  fi
+}
+
+# Direction-aware "destination shouldn't shrink" guard (H1 clock-skew +
+# H3 fork): session JSONLs are append-mostly and only grow, so a transfer
+# whose destination is already LARGER than the source about to overwrite
+# it is a strong signal of clock skew (the mtime-based "newer" verdict
+# above was inverted) or an independent fork with differing mtimes -- a
+# case the mtime state machine's `diverged` bucket does NOT catch (it only
+# fires on an exact mtime tie). This is an added safety gate alongside that
+# state machine, not a replacement for it. Pass "" for dest_size to skip
+# (destination missing or its size couldn't be determined).
+refuse_if_dest_shrinks() {
+  local src_size="$1" dest_size="$2"
+  [ -n "$dest_size" ] || return 0
+  if [ "$dest_size" -gt "$src_size" ]; then
+    die "refusing to overwrite a larger file ($dest_size bytes) with a smaller one ($src_size bytes) — likely a clock-skew or forked session; pass --force to override"
   fi
 }
 
@@ -271,11 +320,17 @@ cmd_push() {
   log "local : $local_file"
   log "remote: $REMOTE:$remote_file"
   log "state : $cmp"
+  if [ "$cmp" = "remote-unknown" ]; then
+    die "could not determine remote state (ssh/stat failed) — refusing to push; never overwrite when we can't read the other side. Check connectivity and retry"
+  fi
   if [ "$cmp" = "remote-newer" ] && [ "$FORCE" -ne 1 ]; then
     die "remote is newer; pull first or pass --force to overwrite"
   fi
   if [ "$cmp" = "diverged" ] && [ "$FORCE" -ne 1 ]; then
     die "same mtime but different size — the copies have diverged; decide which side wins and re-run with --force from that side"
+  fi
+  if [ "$FORCE" -ne 1 ]; then
+    refuse_if_dest_shrinks "$(local_size "$local_file")" "$(_remote_size_or_empty "$remote_file")"
   fi
 
   pre="$(local_mtime "$local_file") $(local_size "$local_file")"
@@ -307,11 +362,19 @@ cmd_pull() {
   log "remote: $REMOTE:$remote_file"
   log "local : $local_file"
   log "state : $cmp"
+  if [ "$cmp" = "remote-unknown" ]; then
+    die "could not determine remote state (ssh/stat failed) — refusing to pull; never overwrite when we can't read the other side. Check connectivity and retry"
+  fi
   if [ "$cmp" = "local-newer" ] && [ "$FORCE" -ne 1 ]; then
     die "local is newer; push first or pass --force to overwrite"
   fi
   if [ "$cmp" = "diverged" ] && [ "$FORCE" -ne 1 ]; then
     die "same mtime but different size — the copies have diverged; decide which side wins and re-run with --force from that side"
+  fi
+  if [ "$FORCE" -ne 1 ]; then
+    local dest_size=""
+    [ -f "$local_file" ] && dest_size="$(local_size "$local_file")"
+    refuse_if_dest_shrinks "$(_remote_size_or_empty "$remote_file")" "$dest_size"
   fi
   mkdir -p "$local_dir"
   rsync -a --progress "$REMOTE:$remote_file" "$local_file"
@@ -335,7 +398,12 @@ session_cwd_local() {
   # Capture all matches then take the first line via parameter expansion --
   # avoids piping to `head -1` which triggers SIGPIPE/141 under `set -o pipefail`.
   if command -v jq >/dev/null 2>&1; then
-    all="$(jq -r '.cwd // empty' "$file" 2>/dev/null || true)"
+    # -R reads each line as raw text and `fromjson?` discards any line that
+    # doesn't parse, instead of jq's default whole-stream-JSON mode aborting
+    # the entire read on the first malformed line (e.g. a torn/partially
+    # written record earlier in a live JSONL) -- matches the python3/grep
+    # fallbacks' per-line tolerance below.
+    all="$(jq -R -r 'fromjson? | .cwd // empty' "$file" 2>/dev/null || true)"
   elif command -v python3 >/dev/null 2>&1; then
     all="$(python3 -c '
 import json, sys
@@ -409,8 +477,10 @@ if [ -n "$want" ] && [ "$cur" != "$want" ]; then
   exit 0
 fi
 echo "before:"; git status --short --branch
-git pull --ff-only
-echo "after:";  git status --short --branch' "$rcwd" "$expected_branch"
+pull_rc=0
+git pull --ff-only || pull_rc=$?
+echo "after:";  git status --short --branch
+exit "$pull_rc"' "$rcwd" "$expected_branch"
 }
 
 # ---- listing ----
@@ -769,6 +839,9 @@ cmd_handoff() {
   local_file="$(find_local_session "$sid")"
   remote_file="$RPROJECTS/$(translate_dir "$(basename "$(dirname "$local_file")")" to-remote)/${sid}.jsonl"
   cmp="$(compare_mtimes "$local_file" "$remote_file")"
+  if [ "$cmp" = "remote-unknown" ]; then
+    die "could not determine remote state (ssh/stat failed); refusing to proceed (remote claude was NOT stopped)"
+  fi
   if [ "$cmp" = "remote-newer" ] && [ "$FORCE" -ne 1 ]; then
     die "remote is newer; pull/handback first or pass --force (remote claude was NOT stopped)"
   fi
@@ -802,14 +875,23 @@ cmd_handoff() {
     cmd_sync_extras "$sid" to-remote || return $?
   fi
 
-  # 6. Restart and disarm the trap.
+  # 6. Restart FIRST, only disarm the trap once it succeeds. If the restart
+  # itself fails, the EXIT trap is still armed: exiting nonzero here fires
+  # _handoff_recover (one more automatic retry), and we also print the same
+  # manual-recovery hint directly so it's visible even if that retry works
+  # or the caller isn't watching for the trap's own message.
   if [ -n "$pane" ]; then
-    trap - EXIT
-    HANDOFF_PANE=""
     log "resuming session in $pane..."
-    restart_remote_claude "$sid" "$pane"
-    log "handoff complete. attach with:"
-    log "  ssh $REMOTE -t tmux attach -t '${pane%%:*}'"
+    if restart_remote_claude "$sid" "$pane"; then
+      trap - EXIT
+      HANDOFF_PANE=""
+      log "handoff complete. attach with:"
+      log "  ssh $REMOTE -t tmux attach -t '${pane%%:*}'"
+    else
+      log "restart failed. Manual recovery:"
+      log "  ssh $REMOTE \"tmux send-keys -t '$pane' 'claude --resume $sid' Enter\""
+      exit 1
+    fi
   else
     log ""
     log "to start the session, attach a tmux session on the remote and run:"
@@ -835,6 +917,9 @@ cmd_handback() {
   remote_file="$(find_remote_session "$sid")"
   local_file="$PROJECTS/$(translate_dir "$(basename "$(dirname "$remote_file")")" to-local)/${sid}.jsonl"
   cmp="$(compare_mtimes "$local_file" "$remote_file")"
+  if [ "$cmp" = "remote-unknown" ]; then
+    die "could not determine remote state (ssh/stat failed); refusing to proceed (remote claude was NOT stopped)"
+  fi
   if [ "$cmp" = "local-newer" ] && [ "$FORCE" -ne 1 ]; then
     die "local is newer; push first or pass --force (remote claude was NOT stopped)"
   fi

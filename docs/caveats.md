@@ -14,10 +14,31 @@ against the same session at the same time.
 
 If you do that, each side appends to its own copy of the JSONL
 independently. There is no merge — you get two diverging conversation
-histories (a fork), and whichever copy you transfer later silently
-overwrites the other's independent history. The fix is procedural, not
-technical: stop the session on one side (`handoff`/`handback` already do
+histories (a fork). The mtime check would let whichever copy you transfer
+later win; the **size-shrink guard** (see
+[docs/internals.md](internals.md)) is the backstop that catches the common
+case, because it refuses to overwrite a larger transcript with a smaller
+one without `--force`. But it is only a heuristic — the real fix is
+procedural: stop the session on one side (`handoff`/`handback` already do
 this for you) before resuming it on the other.
+
+## Clock skew between machines
+
+The `local-newer`/`remote-newer` verdict compares the two machines' clocks
+with no tolerance. If one clock runs ahead (a misconfigured timezone,
+drifting NTP, a sleeping laptop), a copy can look "newer" when it isn't.
+The size-shrink guard limits the damage — a wrong-direction overwrite that
+would shrink the destination is refused — but if you care about ordering,
+keep both machines on NTP. `claude-roam doctor` does not check clock sync;
+`date +%s` on both sides will show any offset.
+
+## When the remote can't be read
+
+If the ssh/stat that inspects the remote copy fails (network drop, host
+down), `claude-roam` reports `remote-unknown` and **refuses** the transfer
+rather than assuming the remote file is absent. This is deliberate:
+treating an unreachable remote as "missing" is the one reading that leads
+to a silent overwrite. Check connectivity and retry.
 
 ## Hub-and-spoke topology
 

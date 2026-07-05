@@ -63,15 +63,31 @@ by mtime and size (`compare_mtimes()` in `bin/claude-roam`):
 
 | Result | Meaning |
 |---|---|
-| `local-missing` / `remote-missing` | one side doesn't have the file yet |
+| `local-missing` / `remote-missing` | one side genuinely doesn't have the file yet (the stat succeeded and reported absence) |
+| `remote-unknown` | the remote stat itself failed (ssh/network) — the remote state is unknown, so `push`/`pull`/`handoff` **refuse** rather than treat it as "missing" and overwrite |
 | `local-newer` / `remote-newer` | mtimes differ; the newer side is presumed authoritative |
 | `equal` | same mtime and same size — nothing to resolve |
-| `diverged` | same mtime, **different** size — both sides were written independently and neither is simply "ahead"; refuses without `--force` |
+| `diverged` | same mtime, **different** size — both sides written independently; refuses without `--force` |
 
-mtime and size are read locally with `stat` (BSD `stat -f` first, GNU
-`stat -c` as a fallback) and on the remote in a single SSH round trip that
+mtime and size are read locally with `stat` (GNU `stat -c` first, BSD
+`stat -f` as a fallback) and on the remote in a single SSH round trip that
 returns both numbers together, so the comparison never straddles a race
 between two separate remote calls.
+
+### The size-shrink guard (clock skew and forks)
+
+The `local-newer`/`remote-newer` verdict trusts the two machines' clocks.
+Two independent clocks can disagree, and `diverged` only catches the narrow
+case of an exact same-second mtime tie — so a genuine fork with differing
+mtimes, or a copy that *looks* newer only because one clock runs ahead,
+would otherwise win and silently overwrite real work.
+
+Session JSONLs are append-mostly and only grow. So on top of the mtime
+verdict, `push`/`pull` apply a direction-aware guard: **they refuse to
+overwrite a larger destination file with a smaller source file** (pass
+`--force` to override). A shrink is a strong signal that the mtime verdict
+was inverted by clock skew, or that the two copies forked. This does not
+require the clocks to agree — it only assumes transcripts don't shrink.
 
 ## Why `rsync -au` never deletes or overwrites a newer file
 

@@ -366,4 +366,53 @@ PROJECTS="$TMP/projects"
 out="$(cmd_recent 5)"
 assert_match "recent prints sid as its own column" "  bbb  " "$out"
 
+# ---- final-review fixes: data-loss guards ----
+# Prior blocks `unset -f` the REAL compare_mtimes/find_remote_session (they
+# share names with stubs). Re-source to restore the genuine functions; the
+# source guard means this only redefines functions, it never runs main.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+GENC="$PROJECTS/$(encode_path "$HOME")-code-guard"; mkdir -p "$GENC"
+printf '0123456789' > "$GENC/gg.jsonl"   # 10 bytes
+
+# H2: a transport failure must NOT read as "remote file missing" (the
+# permissive/overwrite branch) — it must surface as remote-unknown.
+remote_stat() { return 3; }              # simulate ssh/remote-script failure
+assert_eq "compare_mtimes: ssh failure -> remote-unknown" "remote-unknown" "$(compare_mtimes "$GENC/gg.jsonl" /r/f)"
+remote_stat() { printf 'MISSING'; }      # ssh ok, file genuinely absent
+assert_eq "compare_mtimes: MISSING sentinel -> remote-missing" "remote-missing" "$(compare_mtimes "$GENC/gg.jsonl" /r/f)"
+unset -f remote_stat
+
+# H1+H3: the size-shrink guard refuses overwriting a larger dest with a
+# smaller src (skew/fork signal), skips when dest size is unknown.
+rc=0; ( refuse_if_dest_shrinks 10 20 ) >/dev/null 2>&1 || rc=$?
+assert_rc "shrink guard: larger dest -> refuse" 1 "$rc"
+rc=0; ( refuse_if_dest_shrinks 20 10 ) >/dev/null 2>&1 || rc=$?
+assert_rc "shrink guard: smaller dest -> allow" 0 "$rc"
+rc=0; ( refuse_if_dest_shrinks 10 "" ) >/dev/null 2>&1 || rc=$?
+assert_rc "shrink guard: unknown dest -> skip" 0 "$rc"
+
+# M4: remote session lookup dies on ambiguity, mirroring the local side.
+# (real find_remote_session, restored by the re-source above; stub remote_sh)
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+remote_sh() { printf '%s\n%s\n' "/home/alice/.claude/projects/-home-alice-code-p1/dup.jsonl" "/home/alice/.claude/projects/-home-alice-code-p2/dup.jsonl"; }
+rc=0; out="$( (find_remote_session dup) 2>&1 )" || rc=$?
+assert_rc "find_remote_session dies on remote ambiguity" 1 "$rc"
+assert_match "remote ambiguity lists candidates" "code-p2" "$out"
+unset -f remote_sh
+
+# push/pull must refuse (not overwrite) on remote-unknown.
+find_local_session() { printf '%s' "$GENC/gg.jsonl"; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-guard/gg.jsonl"; }
+remote_sh() { :; }
+rsync() { :; }
+FORCE=0
+compare_mtimes() { printf 'remote-unknown'; }
+rc=0; (cmd_push gg) >/dev/null 2>&1 || rc=$?
+assert_rc "push refuses remote-unknown" 1 "$rc"
+rc=0; (cmd_pull gg) >/dev/null 2>&1 || rc=$?
+assert_rc "pull refuses remote-unknown" 1 "$rc"
+unset -f compare_mtimes rsync remote_sh find_remote_session find_local_session require_remote
+
 t_summary
