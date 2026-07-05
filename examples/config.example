@@ -1,0 +1,21 @@
+# claude-roam configuration.
+# This file is SOURCED as shell by claude-roam — it can run commands.
+# Protect it like a shell rc file (chmod 600, own it yourself).
+
+# Default remote: an SSH host alias from your ~/.ssh/config (key-based auth).
+CLAUDE_ROAM_REMOTE="myserver"
+
+# $HOME-relative dirs whose immediate children are project checkouts.
+# Used by `sync-all` to find per-project .claude/ artifacts.
+PROJECT_ROOTS=(code)
+
+# Per-project .claude/ subdirs carried between machines (gitignored working
+# artifacts: specs, reviews, codebase notes, user-authored agents/skills).
+PROJECT_CLAUDE_EXTRAS=(plans reviews codebase-knowledge agent-memory agents skills)
+
+# Per-session dirs (siblings of the session JSONL) to carry along.
+SESSION_DIR_EXTRAS=(memory)
+
+# $HOME-relative dirs that always sync, independent of any session.
+# Example: HOME_RELATIVE_EXTRAS=(code/dev-docs)
+HOME_RELATIVE_EXTRAS=()

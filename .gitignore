@@ -1,0 +1,4 @@
+*.bak
+.DS_Store
+.superpowers/
+scripts/leak-scan.local

@@ -1,0 +1,29 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: leak-scan
+        run: bash scripts/leak-scan.sh
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck bin/claude-roam install.sh scripts/leak-scan.sh test/harness.sh test/unit.sh test/smoke.sh
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: unit tests (bash 5)
+        run: bash test/unit.sh
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: unit tests (system bash 3.2)
+        run: |
+          /bin/bash -c 'echo "bash: $BASH_VERSION"; [ "${BASH_VERSINFO[0]}" -eq 3 ]'
+          /bin/bash test/unit.sh
