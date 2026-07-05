@@ -421,41 +421,153 @@ cmd_pull() {
 
 # ---- project / repo ----
 
-# Read the cwd from inside the JSONL — authoritative even when the encoded
-# project dir name is ambiguous (e.g. project names containing hyphens).
-# Prefer jq for proper JSON unescaping; fall back to a python3 one-liner;
-# last resort is grep+sed which doesn't unescape (acceptable for the common
-# case of paths without backslashes or quotes).
-session_cwd_local() {
-  local sid="$1" file cwd all
-  file="$(find_local_session "$sid")"
-  # Capture all matches then take the first line via parameter expansion --
-  # avoids piping to `head -1` which triggers SIGPIPE/141 under `set -o pipefail`.
-  if command -v jq >/dev/null 2>&1; then
-    # -R reads each line as raw text and `fromjson?` discards any line that
-    # doesn't parse, instead of jq's default whole-stream-JSON mode aborting
-    # the entire read on the first malformed line (e.g. a torn/partially
-    # written record earlier in a live JSONL) -- matches the python3/grep
-    # fallbacks' per-line tolerance below.
-    all="$(jq -R -r 'fromjson? | .cwd // empty' "$file" 2>/dev/null || true)"
-  elif command -v python3 >/dev/null 2>&1; then
-    all="$(python3 -c '
+# A session's local project cwd is resolved from the JSONL `cwd` records --
+# NOT by decoding the encoded directory name, which is ambiguous (both '/'
+# and a literal '-' encode to '-'). A transcript that ORIGINATED on the
+# remote still carries a remote-home cwd (e.g. /home/alice/...) even after it
+# lands in the correctly-translated local project dir, so we recover the
+# LOCAL path by matching each candidate against the session file's encoded
+# parent directory name (which push/pull already translate correctly).
+#
+# POSIX-sh snippet that reads a JSONL file ($1) and prints each *string*
+# `.cwd` value, one per line, EXCLUDING any value containing a newline or
+# carriage return. Excluding embedded newlines is what makes the plain
+# newline-delimited framing safe: a crafted `"evil\n/other"` cwd is dropped
+# rather than split into a phantom second candidate. A legitimate project
+# cwd never contains a newline. Used verbatim on both the local machine and
+# (via remote_sh) the remote, so both sides frame candidates identically.
+cwd_extract_script() {
+cat <<'SH'
+f="$1"
+if command -v jq >/dev/null 2>&1; then
+  jq -R -r 'fromjson? | select(type=="object") | .cwd | select(type=="string") | select((contains("\n") or contains("\r")) | not)' "$f" 2>/dev/null
+elif command -v python3 >/dev/null 2>&1; then
+  python3 -c '
 import json, sys
-for line in open(sys.argv[1]):
-    try:
-        o = json.loads(line)
-    except Exception:
-        continue
-    if isinstance(o, dict) and o.get("cwd"):
-        print(o["cwd"]); break
-' "$file" 2>/dev/null || true)"
-  else
-    all="$(grep -m1 -oE '"cwd":"[^"]+"' "$file" 2>/dev/null \
-      | sed -E 's/^"cwd":"//; s/"$//' || true)"
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(o, dict):
+            c = o.get("cwd")
+            if isinstance(c, str) and "\n" not in c and "\r" not in c:
+                print(c)
+' "$f" 2>/dev/null
+else
+  grep -oE '"cwd":"/[^"\\]*"' "$f" 2>/dev/null | sed -E 's/^"cwd":"//; s/"$//'
+fi
+SH
+}
+
+# Run the extractor locally against $1. Always exits 0 (a missing tool /
+# no-match must read as "no candidates", never as a pipeline failure that
+# `set -o pipefail` would surface to the resolver below).
+_extract_cwd_candidates() { bash -c "$(cwd_extract_script)" _ "$1" 2>/dev/null || true; }
+
+# Validate one candidate is an absolute, lexically-normal path. Strips a
+# single trailing slash (harmless) but REFUSES '//', '/./', '/../', and bare
+# '.'/'..' components rather than resolving them (they could textually match
+# the encoded parent while pointing elsewhere). Prints the cleaned path, or
+# returns 1.
+_clean_abs_cwd() {
+  local p="$1"
+  case "$p" in
+    /)  printf '/'; return 0 ;;
+    /*) ;;
+    *)  return 1 ;;
+  esac
+  case "$p" in
+    *//*|*/./*|*/../*|*/.|*/..) return 1 ;;
+  esac
+  case "$p" in */) p="${p%/}" ;; esac
+  printf '%s' "$p"
+}
+
+# Resolve one cleaned candidate ($1) to a LOCAL cwd, given the session file's
+# encoded parent dir name ($2) and the encoded local $HOME ($3). Prints the
+# local path and returns 0 on a match, else returns 1.
+#   Direct match:  the candidate already encodes to the parent (local-origin,
+#                  or a session whose project sits outside $HOME).
+#   Foreign match: ONLY when the parent is the encoded local $HOME or a child
+#                  of it. Encoding is length-preserving, so the last k chars
+#                  of the candidate (k = length of the parent's tail past the
+#                  home prefix) are the relative suffix; its slashes must
+#                  encode back to that tail. k=0 (parent IS $HOME) maps any
+#                  candidate to $HOME. NOTE: because '/' and '-' collide under
+#                  encoding, this trusts the candidate's own slash placement;
+#                  it authenticates a legitimate remote-origin path but cannot
+#                  detect a maliciously slash-shifted single record.
+_resolve_cwd_candidate() {
+  local c="$1" parent="$2" lhp="$3" tail k clen suffix enc
+  enc="$(encode_path "$c")"
+  if [ "$enc" = "$parent" ]; then
+    printf '%s' "$c"
+    return 0
   fi
-  cwd="${all%%$'\n'*}"
-  [ -n "$cwd" ] || die "could not read cwd from session $sid"
-  printf '%s' "$cwd"
+  if [ "$parent" = "$lhp" ] || [[ "$parent" == "$lhp"-* ]]; then
+    tail="${parent#"$lhp"}"
+    k="${#tail}"
+    clen="${#c}"
+    if [ "$k" -eq 0 ]; then
+      printf '%s' "$HOME"
+      return 0
+    fi
+    if [ "$clen" -ge "$k" ]; then
+      suffix="${c:$((clen - k))}"
+      case "$suffix" in
+        /*)
+          if [ "$(printf '%s' "$suffix" | tr '/' '-')" = "$tail" ]; then
+            printf '%s%s' "$HOME" "$suffix"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+  fi
+  return 1
+}
+
+# Read newline-delimited candidates on stdin, resolve each against parent $1,
+# and emit the single agreed-upon local path. Distinct validating results are
+# an ambiguity refusal.
+#   prints path, returns 0  -- exactly one distinct resolution
+#   returns 1               -- no candidate matched the parent
+#   returns 2               -- candidates resolved to conflicting local paths
+_resolve_cwd_stream() {
+  local parent="$1" lhp resolved="" found=0 ambiguous=0 raw cand r
+  lhp="$(encode_path "$HOME")"
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    [ -n "$raw" ] || continue
+    cand="$(_clean_abs_cwd "$raw")" || continue
+    r="$(_resolve_cwd_candidate "$cand" "$parent" "$lhp")" || continue
+    [ -n "$r" ] || continue
+    if [ "$found" -eq 0 ]; then
+      resolved="$r"; found=1
+    elif [ "$r" != "$resolved" ]; then
+      ambiguous=1
+    fi
+  done
+  if [ "$ambiguous" -eq 1 ]; then return 2; fi
+  if [ "$found" -eq 0 ]; then return 1; fi
+  printf '%s' "$resolved"
+}
+
+# Authoritative LOCAL project cwd for a session: resolve the JSONL's cwd
+# records against the (correctly-translated) local parent directory name.
+session_cwd_local() {
+  local sid="$1" file parent out rc=0
+  file="$(find_local_session "$sid")"
+  parent="$(basename "$(dirname "$file")")"
+  out="$(_extract_cwd_candidates "$file" | _resolve_cwd_stream "$parent")" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    die "session $sid has cwd records resolving to different local project dirs; refusing to guess (project '$parent')"
+  fi
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    die "could not resolve a local cwd for session $sid: no cwd record matches its project dir '$parent'"
+  fi
+  printf '%s' "$out"
 }
 
 # Translate the local cwd to the corresponding path under the remote's $HOME.
@@ -591,7 +703,7 @@ cmd_repo_status() {
 cmd_repo_status_remote() {
   local sid="$1" rcwd
   require_remote
-  rcwd="$(session_cwd_remote "$sid")"
+  rcwd="$(session_cwd_remote "$sid")" || return $?
   log "remote: $REMOTE:$rcwd"
   remote_sh 'cd "$1" 2>/dev/null || { echo "remote dir missing or not a repo"; exit 0; }
 git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "not-a-repo: $1"; exit 0; }
@@ -601,7 +713,7 @@ git status --short --branch' "$rcwd"
 cmd_repo_pull() {
   local sid="$1" expected_branch="${2:-}" rcwd
   require_remote
-  rcwd="$(session_cwd_remote "$sid")"
+  rcwd="$(session_cwd_remote "$sid")" || return $?
   log "pulling on $REMOTE:$rcwd"
   remote_sh 'set -u
 rcwd="$1"; want="$2"
@@ -699,13 +811,18 @@ _sync_from() {
 }
 
 cmd_sync_extras() {
-  local sid="$1" direction="${2:-to-remote}" lcwd rcwd lenc enc_name renc_name renc
-  local sub rel
+  # Optional args 3/4 let a caller (handback) pass an already-validated
+  # local/remote cwd so this step never re-parses mutable data. When absent
+  # (standalone / handoff), resolve here -- with explicit `|| return $?` so a
+  # resolver failure can't degrade into an empty-path no-op under the
+  # errexit-disabling `||` call contexts (see the H1/H4 comments elsewhere).
+  local sid="$1" direction="${2:-to-remote}" lcwd="${3:-}" rcwd="${4:-}"
+  local lenc enc_name renc_name renc sub rel
   require_remote
 
-  lcwd="$(session_cwd_local "$sid")"
-  rcwd="$(session_cwd_remote "$sid")"
-  lenc="$(dirname "$(find_local_session "$sid")")"
+  if [ -z "$lcwd" ]; then lcwd="$(session_cwd_local "$sid")" || return $?; fi
+  if [ -z "$rcwd" ]; then rcwd="$(session_cwd_remote "$sid")" || return $?; fi
+  lenc="$(dirname "$(find_local_session "$sid")")" || return $?
   enc_name="$(basename "$lenc")"
   renc_name="$(translate_dir "$enc_name" to-remote)"
   renc="$RPROJECTS/$renc_name"
@@ -1049,7 +1166,10 @@ cmd_handoff() {
   fi
 
   # Record the local branch for the remote pull sanity check.
-  lcwd="$(session_cwd_local "$sid")"
+  # Propagate a resolver failure (|| return $?) so it can't degrade to an
+  # empty path in an errexit-disabled caller — consistent with the other
+  # cwd assignments; this preflight runs before the remote is stopped.
+  lcwd="$(session_cwd_local "$sid")" || return $?
   if git -C "$lcwd" rev-parse --abbrev-ref HEAD >/dev/null 2>&1; then
     lbranch="$(git -C "$lcwd" rev-parse --abbrev-ref HEAD)"
   fi
@@ -1110,6 +1230,7 @@ cmd_handoff() {
 
 cmd_handback() {
   local sid="$1" pane_info pane="" remote_file local_file cmp
+  local hb_lcwd="" hb_rcwd="" lparent hb_rc=0 extras_rc=0
   require_remote
 
   # 1. Locate the remote pane (mirrors handoff step 1).
@@ -1136,6 +1257,24 @@ cmd_handback() {
     die "local and remote have diverged; resolve first (remote claude was NOT stopped)"
   fi
 
+  # 2b. Resolve the project cwd from the REMOTE transcript that is ABOUT to be
+  # pulled -- not any stale local copy, which the pull will replace. A
+  # remote-origin session carries a remote-home cwd, and extras cannot proceed
+  # until we can map it to a local project dir. Doing it here, before the stop,
+  # means an unresolvable/ambiguous cwd refuses while the remote is still
+  # running rather than stranding it after the stop. The validated result is
+  # carried into the post-pull extras step (no re-parsing of mutable data).
+  if [ "$NO_EXTRAS" -ne 1 ]; then
+    lparent="$(translate_dir "$(basename "$(dirname "$remote_file")")" to-local)"
+    hb_lcwd="$(remote_sh "$(cwd_extract_script)" "$remote_file" | _resolve_cwd_stream "$lparent")" || hb_rc=$?
+    if [ "$hb_rc" -ne 0 ] || [ -z "$hb_lcwd" ]; then
+      die "could not resolve the session's project dir from the remote transcript (project '$lparent'); refusing to hand back (remote claude was NOT stopped). Re-run with --no-extras to pull the transcript only"
+    fi
+    case "$hb_lcwd" in
+      "$HOME"|"$HOME"/*) hb_rcwd="$RHOME${hb_lcwd#"$HOME"}" ;;
+    esac
+  fi
+
   # 3. Stop the remote writer — pulling while it writes tears the copy.
   if [ -n "$pane" ]; then
     log "stopping remote claude in $pane before pulling..."
@@ -1147,11 +1286,20 @@ cmd_handback() {
   # above already adjudicated.
   FORCE=1 cmd_pull "$sid"
   if [ "$NO_EXTRAS" -ne 1 ]; then
-    cmd_sync_extras "$sid" from-remote
+    # Pass the pre-validated cwd forward (hb_rcwd may be "" for a cwd outside
+    # $HOME -- cmd_sync_extras then derives it from the now-local transcript,
+    # whose bytes are identical to the remote source we already validated).
+    cmd_sync_extras "$sid" from-remote "$hb_lcwd" "$hb_rcwd" || extras_rc=$?
   fi
   log ""
   log "to resume locally, cd to the matching project dir and run:"
   log "  claude --resume $sid"
+  if [ "$extras_rc" -ne 0 ]; then
+    log ""
+    log "WARNING: the transcript pulled cleanly but syncing its extras failed (exit $extras_rc)."
+    log "  the session is usable locally; re-run: claude-roam sync-extras $sid from-remote"
+    return "$extras_rc"
+  fi
 }
 
 # ---- doctor ----

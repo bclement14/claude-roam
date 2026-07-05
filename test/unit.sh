@@ -597,4 +597,189 @@ else
   REQUIRE_CLEAN=0
 fi
 
+# ---- H6 rev2: remote-origin session cwd resolution ----
+# Resolve a session's LOCAL project cwd from its JSONL cwd records by matching
+# each candidate against the encoded parent dir name (which push/pull already
+# translate), instead of blindly trusting the first record. Prior blocks
+# `unset -f`'d the real resolver/helpers; re-source to restore them.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+LHP="$(encode_path "$HOME")"
+
+# make a session file: $1 encoded-parent-dir, $2 sid, $3 printf-body (%b)
+h6mk() { local d="$PROJECTS/$1"; mkdir -p "$d"; printf '%b' "$3" > "$d/$2.jsonl"; }
+
+# 1. foreign remote-origin cwd -> resolves to the correct LOCAL project dir.
+h6mk "$LHP-code-my-app" h6a '{"type":"x","cwd":"/home/alice/code/my-app"}\n'
+assert_eq "H6.1 resolves remote-origin cwd to local dir" "$HOME/code/my-app" "$(session_cwd_local h6a)"
+
+# 2. hyphen-ambiguous parent decoded via the candidate's own slashes.
+h6mk "$LHP-code-my-app" h6b '{"cwd":"/home/alice/code/my/app"}\n'
+assert_eq "H6.2 hyphen-ambiguous parent uses candidate slash placement" "$HOME/code/my/app" "$(session_cwd_local h6b)"
+
+# 3. session_cwd_remote round-trips the resolved cwd back to remote $HOME.
+require_remote() { :; }; RHOME="/home/alice"
+assert_eq "H6.3 session_cwd_remote round-trips remote-origin" "/home/alice/code/my-app" "$(session_cwd_remote h6a)"
+unset -f require_remote
+
+# 4. a single non-colliding mismatched record refuses; a valid later record wins.
+h6mk "$LHP-code-my-app" h6d '{"cwd":"/some/other/proj"}\n'
+rc=0; (session_cwd_local h6d) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.4 lone non-matching cwd record -> refuse" 1 "$rc"
+h6mk "$LHP-code-my-app" h6d2 '{"cwd":"/some/other/proj"}\n{"cwd":"/home/alice/code/my-app"}\n'
+assert_eq "H6.4 a later matching record is used" "$HOME/code/my-app" "$(session_cwd_local h6d2)"
+
+# 5. two records resolving to DIFFERENT local dirs -> ambiguous refusal.
+h6mk "$LHP-code-my-app" h6e '{"cwd":"/home/alice/code/my-app"}\n{"cwd":"/home/alice/code-my/app"}\n'
+rc=0; (session_cwd_local h6e) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.5 conflicting resolutions -> refuse" 1 "$rc"
+
+# 6. local-origin direct match (candidate already encodes to the parent).
+h6mk "$LHP-code-loc" h6f "$(printf '{"cwd":"%s/code/loc"}\n' "$HOME")"
+assert_eq "H6.6 local-origin direct match" "$HOME/code/loc" "$(session_cwd_local h6f)"
+
+# 10. single-record local collision: '/' vs literal '-' both encode to '-', so
+# code-my/app and code/my-app share a parent. Policy: trust the sole candidate's
+# slash placement (documented; NOT a security guarantee).
+h6mk "$LHP-code-my-app" h6g "$(printf '{"cwd":"%s/code-my/app"}\n' "$HOME")"
+assert_eq "H6.10 sole local colliding candidate is trusted as-is" "$HOME/code-my/app" "$(session_cwd_local h6g)"
+
+# 11. single-record foreign collision: remote-origin path with a literal hyphen
+# dir maps preserving its slash placement.
+h6mk "$LHP-code-my-app" h6h '{"cwd":"/home/alice/code-my/app"}\n'
+assert_eq "H6.11 sole foreign colliding candidate preserves slashes" "$HOME/code-my/app" "$(session_cwd_local h6h)"
+
+# 12. relative cwd is not absolute -> refused (encode_path strips a leading '/'
+# so a relative path would otherwise encode like an absolute one).
+h6mk "$LHP-code-my-app" h6i '{"cwd":"home/alice/code/my-app"}\n'
+rc=0; (session_cwd_local h6i) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.12 relative cwd refused" 1 "$rc"
+
+# 13. a cwd whose JSON value embeds a newline escape (valid JSON: "evil\n/...")
+# must NOT split into a phantom second candidate. Old `jq -r` emitted two lines
+# and the first-record pick returned "evil"; the new extractor drops the whole
+# newline-bearing value. The `\\n` below is a literal backslash-n in the file.
+h6mk "$LHP-code-my-app" h6j '{"cwd":"evil\\n/home/alice/code/my-app"}\n'
+rc=0; out="$( (session_cwd_local h6j) 2>&1 )" || rc=$?
+assert_rc "H6.13 newline-in-cwd does not split into a phantom candidate" 1 "$rc"
+case "$out" in *evil*) t_fail "H6.13 must not return the pre-newline fragment" "$out" ;; *) t_ok "H6.13 does not return the pre-newline fragment" ;; esac
+
+# 14. non-string cwd is ignored.
+h6mk "$LHP-code-my-app" h6k '{"cwd":123}\n'
+rc=0; (session_cwd_local h6k) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.14 non-string cwd refused" 1 "$rc"
+
+# 15. trailing slash is normalized away.
+h6mk "$LHP-code-my-app" h6l "$(printf '{"cwd":"%s/code/my-app/"}\n' "$HOME")"
+assert_eq "H6.15 trailing slash normalized" "$HOME/code/my-app" "$(session_cwd_local h6l)"
+
+# 16. dot/dotdot components are refused (they could textually match yet point
+# elsewhere).
+h6mk "$LHP-code-my-app" h6m "$(printf '{"cwd":"%s/code/../evil"}\n' "$HOME")"
+rc=0; (session_cwd_local h6m) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.16 dotdot component refused" 1 "$rc"
+
+# 17. a session whose project lives OUTSIDE $HOME resolves via direct match.
+h6mk "-tmp-code-app" h6n '{"cwd":"/tmp/code/app"}\n'
+assert_eq "H6.17 outside-\$HOME direct match" "/tmp/code/app" "$(session_cwd_local h6n)"
+
+# 18. an outside-$HOME parent must NOT accept a foreign-suffix (home-mapped)
+# false match — only direct matches are valid there.
+h6mk "-tmp-code-app" h6o '{"cwd":"/foreign/tmp/code/app"}\n'
+rc=0; (session_cwd_local h6o) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.18 outside-\$HOME foreign false-match refused" 1 "$rc"
+
+# 19 + 20. push calls session_cwd_local for its repo-clean advisory; a
+# remote-origin session now resolves to the real local repo (M1 blast radius).
+if command -v git >/dev/null 2>&1; then
+  WPROJ="$HOME/code/warnproj"; mkdir -p "$WPROJ"
+  git -C "$WPROJ" init -q >/dev/null 2>&1
+  printf 'x' > "$WPROJ/dirty.txt"            # untracked -> dirty
+  h6mk "$LHP-code-warnproj" h6w '{"cwd":"/home/alice/code/warnproj"}\n'
+  require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+  remote_sh() { :; }
+  compare_mtimes() { printf 'local-newer'; }
+  rsync() { printf '%s\n' "$*" >> "$TMP/h6_wrsync"; }
+  : > "$TMP/h6_wrsync"; FORCE=1
+
+  REQUIRE_CLEAN=0
+  out="$( (cmd_push h6w) 2>&1 )" || true
+  assert_match "H6.19 push resolves remote-origin cwd and warns on dirty repo" "WARNING" "$out"
+
+  REQUIRE_CLEAN=1
+  rc=0; out="$( (cmd_push h6w) 2>&1 )" || rc=$?
+  assert_rc "H6.20 push --require-clean refuses a dirty remote-origin repo" 1 "$rc"
+  assert_match "H6.20 refusal names the unclean repo" "not clean" "$out"
+  unset -f require_remote remote_sh compare_mtimes rsync
+  REQUIRE_CLEAN=0; FORCE=0
+else
+  t_ok "H6.19/20 push remote-origin cwd tests skipped (no git on PATH)"
+fi
+
+# 9. cmd_repo_pull must PROPAGATE a cwd-resolution failure, not no-op to success
+# (its rcwd assignment runs inside handoff's errexit-disabling `|| return`).
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+session_cwd_remote() { return 1; }
+: > "$TMP/h6_rp"; remote_sh() { echo ran >> "$TMP/h6_rp"; }
+rc=0; (cmd_repo_pull h6a) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.9 cmd_repo_pull propagates a cwd-resolution failure" 1 "$rc"
+assert_eq "H6.9 no remote git runs after resolver failure" "" "$(cat "$TMP/h6_rp")"
+unset -f require_remote session_cwd_remote remote_sh
+
+# 21. cmd_sync_extras must likewise propagate a resolver failure.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+session_cwd_local() { return 1; }
+find_local_session() { printf '%s' "$PROJECTS/$LHP-code-my-app/h6a.jsonl"; }
+: > "$TMP/h6_se"; _sync_from() { echo "xfer $*" >> "$TMP/h6_se"; }
+PROJECT_CLAUDE_EXTRAS=(plans); SESSION_DIR_EXTRAS=(); HOME_RELATIVE_EXTRAS=()
+rc=0; (cmd_sync_extras h6a from-remote) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.21 cmd_sync_extras propagates a cwd-resolution failure" 1 "$rc"
+assert_eq "H6.21 no transfers run after resolver failure" "" "$(cat "$TMP/h6_se")"
+unset -f require_remote session_cwd_local find_local_session _sync_from
+load_config   # restore extras arrays
+
+# 7. handback must validate the REMOTE source cwd BEFORE stopping the remote:
+# an unresolvable remote transcript refuses while claude is still running.
+STOPF="$TMP/h6_hb_stop"; : > "$STOPF"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/h6r.jsonl"; }
+find_remote_pane() { printf 'OK main:1.0'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$STOPF"; }
+cmd_pull() { echo pull >> "$STOPF"; }
+remote_sh() { printf '/home/alice/UNRELATED/place\n'; }   # remote cwd extractor: unresolvable
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; (cmd_handback h6r) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.7 handback refuses unresolvable remote cwd" 1 "$rc"
+assert_eq "H6.7 handback did NOT stop the remote before the refusal" "" "$(cat "$STOPF")"
+
+# 8. --no-extras skips the cwd preflight and pulls the transcript regardless.
+: > "$STOPF"; NO_EXTRAS=1
+rc=0; (cmd_handback h6r) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.8 handback --no-extras proceeds despite unresolvable cwd" 0 "$rc"
+assert_match "H6.8 handback --no-extras still stops and pulls" "stop" "$(cat "$STOPF")"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes stop_remote_claude cmd_pull remote_sh
+NO_EXTRAS=0
+
+# 22. handoff: a resolver failure surfacing AFTER the preflight (records mutated
+# between reads) must propagate — not degrade into "handoff complete".
+CALLS2="$TMP/h6_ho"; : > "$CALLS2"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_local_session() { printf '%s' "$PROJECTS/$LHP-code-my-app/h6a.jsonl"; }
+find_remote_pane() { printf 'OK main:1.0'; }
+compare_mtimes() { printf 'local-newer'; }
+session_cwd_local() { printf '%s' "$HOME/code/my-app"; }   # preflight resolves fine
+session_cwd_remote() { return 1; }                          # later read: unresolvable
+stop_remote_claude() { echo stop >> "$CALLS2"; }
+cmd_push() { echo push >> "$CALLS2"; }
+remote_sh() { :; }
+restart_remote_claude() { echo restart >> "$CALLS2"; }
+NO_EXTRAS=0; NO_STOP=0; FORCE=0
+rc=0; (cmd_handoff h6a) >/dev/null 2>&1 || rc=$?
+assert_rc "H6.22 handoff propagates a post-preflight resolver failure" 1 "$rc"
+assert_match "H6.22 handoff attempted restart after the failure" "restart" "$(cat "$CALLS2")"
+unset -f require_remote find_local_session find_remote_pane compare_mtimes \
+  session_cwd_local session_cwd_remote stop_remote_claude cmd_push remote_sh restart_remote_claude
+
 t_summary
