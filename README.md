@@ -111,6 +111,7 @@ claude-roam doctor                   check prerequisites (local, and remote if c
 | `--force` | Skip the newer-side mtime/size check |
 | `--no-extras` | Skip the `sync-extras` step inside `handoff` / `handback` |
 | `--no-stop` | `handback`: don't stop a running remote claude first |
+| `--require-clean` | `push`/`handoff`/`sync-all`: refuse (instead of warn) if a session's project repo has uncommitted or unpushed work |
 | `-h`, `--help` | Show usage |
 
 `--force` always overwrites the **destination** of the command you ran:

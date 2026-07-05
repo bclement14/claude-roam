@@ -503,4 +503,98 @@ rc=0; (_sync_from /home/alice/.claude/projects/-home-alice-code-p1/plans "$TMP/m
 assert_rc "M2: _sync_from returns 0 when the remote dir is genuinely absent" 0 "$rc"
 unset -f remote_sh
 
+# ---- repo_sync_state / warn_repo_unclean / --require-clean ----
+# Prior blocks `unset -f` several of the real functions this section
+# relies on (remote_sh, compare_mtimes, find_local_session, require_remote)
+# -- re-source first to bring back the genuine implementations before
+# layering test-local stubs on top.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+
+if ! command -v git >/dev/null 2>&1; then
+  t_ok "repo_sync_state/warn_repo_unclean/--require-clean tests skipped (no git on PATH)"
+else
+  RSDIR="$TMP/reposync"; mkdir -p "$RSDIR"
+
+  # no-dir: path does not exist at all.
+  repo_sync_state "$RSDIR/does-not-exist"
+  assert_eq "repo_sync_state: missing dir -> no-dir" "no-dir" "$REPO_STATE"
+
+  # not-a-repo: dir exists, no .git.
+  mkdir -p "$RSDIR/notrepo"
+  repo_sync_state "$RSDIR/notrepo"
+  assert_eq "repo_sync_state: plain dir -> not-a-repo" "not-a-repo" "$REPO_STATE"
+
+  # dirty: untracked file, no commits at all yet.
+  mkdir -p "$RSDIR/dirtyrepo"
+  git -C "$RSDIR/dirtyrepo" init -q >/dev/null 2>&1
+  printf 'x' > "$RSDIR/dirtyrepo/f.txt"
+  repo_sync_state "$RSDIR/dirtyrepo"
+  assert_eq "repo_sync_state: untracked file -> dirty" "dirty" "$REPO_STATE"
+
+  # no-upstream: clean and committed, but the branch has no upstream at all.
+  mkdir -p "$RSDIR/noupstream"
+  git -C "$RSDIR/noupstream" init -q -b main >/dev/null 2>&1
+  printf 'x' > "$RSDIR/noupstream/f.txt"
+  git -C "$RSDIR/noupstream" add f.txt >/dev/null 2>&1
+  git -C "$RSDIR/noupstream" -c user.name=t -c user.email=t@example.com commit -q -m init >/dev/null 2>&1
+  repo_sync_state "$RSDIR/noupstream"
+  assert_eq "repo_sync_state: committed, no upstream -> no-upstream" "no-upstream" "$REPO_STATE"
+
+  # clean + unpushed: a bare "remote" plus a clone tracking it.
+  BARE="$RSDIR/bare.git"; CLONE="$RSDIR/clone"
+  git init -q --bare -b main "$BARE" >/dev/null 2>&1
+  git clone -q "$BARE" "$CLONE" >/dev/null 2>&1
+  git -C "$CLONE" -c user.name=t -c user.email=t@example.com commit -q -m init --allow-empty >/dev/null 2>&1
+  git -C "$CLONE" push -q -u origin main >/dev/null 2>&1
+  repo_sync_state "$CLONE"
+  assert_eq "repo_sync_state: clean and pushed -> clean" "clean" "$REPO_STATE"
+
+  git -C "$CLONE" -c user.name=t -c user.email=t@example.com commit -q -m second --allow-empty >/dev/null 2>&1
+  repo_sync_state "$CLONE"
+  assert_eq "repo_sync_state: one local commit not yet pushed -> unpushed" "unpushed" "$REPO_STATE"
+  assert_eq "repo_sync_state: REPO_AHEAD_COUNT counts the unpushed commit" "1" "$REPO_AHEAD_COUNT"
+
+  # warn_repo_unclean: dirty repo -> returns 1, warns on stderr naming the label.
+  rc=0; (warn_repo_unclean "$RSDIR/dirtyrepo" "dirtylabel") >/dev/null 2>/dev/null || rc=$?
+  assert_rc "warn_repo_unclean: dirty repo returns 1" 1 "$rc"
+  err="$(warn_repo_unclean "$RSDIR/dirtyrepo" "dirtylabel" 2>&1 1>/dev/null)"
+  assert_match "warn_repo_unclean: dirty repo warning names the label" "dirtylabel" "$err"
+  assert_match "warn_repo_unclean: dirty repo warning says WARNING" "WARNING" "$err"
+
+  # warn_repo_unclean: non-repo -> returns 0, prints nothing at all.
+  rc=0; (warn_repo_unclean "$RSDIR/notrepo" "notrepolabel") >/dev/null 2>/dev/null || rc=$?
+  assert_rc "warn_repo_unclean: non-repo returns 0" 0 "$rc"
+  out="$(warn_repo_unclean "$RSDIR/notrepo" "notrepolabel" 2>&1)"
+  assert_eq "warn_repo_unclean: non-repo prints nothing" "" "$out"
+
+  # push --require-clean: reuse the Task 7 stub pattern (stub every
+  # remote-facing call so cmd_push exercises only decision logic), plus
+  # stub session_cwd_local directly to point the push at the dirty repo.
+  require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+  remote_sh() { :; }
+  compare_mtimes() { printf 'local-newer'; }
+  find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+  session_cwd_local() { printf '%s' "$RSDIR/dirtyrepo"; }
+  RSYNC_RC_LOG="$TMP/rsynclog_requireclean"; : > "$RSYNC_RC_LOG"
+  rsync() { printf '%s\n' "$*" >> "$RSYNC_RC_LOG"; }
+  FORCE=1
+
+  REQUIRE_CLEAN=1
+  rc=0; out="$( (cmd_push bbb) 2>&1 )" || rc=$?
+  assert_rc "push --require-clean dies when the project repo is dirty" 1 "$rc"
+  assert_match "push --require-clean death names what's wrong" "not clean" "$out"
+  assert_eq "push --require-clean never reaches rsync" "" "$(cat "$RSYNC_RC_LOG")"
+
+  REQUIRE_CLEAN=0
+  : > "$RSYNC_RC_LOG"
+  rc=0; out="$( (cmd_push bbb) 2>&1 )" || rc=$?
+  assert_rc "push without --require-clean proceeds despite a dirty repo" 0 "$rc"
+  assert_match "push without --require-clean still prints the warning" "WARNING" "$out"
+  assert_match "push without --require-clean still transfers the jsonl" "bbb.jsonl" "$(cat "$RSYNC_RC_LOG")"
+
+  unset -f require_remote remote_sh compare_mtimes find_local_session session_cwd_local rsync
+  REQUIRE_CLEAN=0
+fi
+
 t_summary

@@ -67,7 +67,27 @@ flags:
   --force             overwrite JSONL even if the destination is newer
   --no-extras         skip the sync-extras step inside handoff / handback
   --no-stop           handback: do not stop a running remote claude first
+  --require-clean     push/handoff/sync-all: refuse (instead of warn) if a
+                      session's project repo has uncommitted or unpushed work
 ```
+
+## Repo-guard warning (`push` / `handoff` / `sync-all`)
+
+`push`, `handoff`, and `sync-all` all check the session's project repo for
+uncommitted or unpushed work before transferring anything — the JSONL and
+the code it references travel separately (git moves the code), so a dirty
+or unpushed repo means the resumed session on the other side may point at
+code that isn't there. By default this only warns loudly to stderr (the
+transfer still proceeds); `--require-clean` upgrades it to a hard refusal.
+`handoff` runs this check in its preflight, before stopping the remote
+`claude`, so a `--require-clean` refusal never strands it.
+
+If you see this warning (or a `claude-roam` command reports it refused
+because of `--require-clean`), surface it to the user plainly — don't
+silently retry with `--require-clean` dropped or silently proceed past a
+refusal. Tell them which project is unclean and what's wrong (uncommitted
+changes / unpushed commits / no upstream), and let them decide whether to
+commit-and-push first or proceed anyway.
 
 ## What `sync-extras` syncs
 

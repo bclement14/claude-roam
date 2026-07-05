@@ -12,6 +12,28 @@ conversation transcript, so `claude-roam` doesn't pretend to have one:
 one side is authoritative at a time, and you tell it which by pushing or
 pulling.
 
+## The repo-guard reminder: git moves the code, claude-roam moves the JSONL
+
+A session's JSONL references a project directory, but the CODE in that
+directory travels over git, not over `claude-roam` — the two are moved by
+different tools on different schedules. If a project repo has uncommitted
+or unpushed work when its session is synced to another machine, the
+resumed session ends up pointing at code that isn't there yet.
+
+`push`, `handoff`, and `sync-all` all check the session's project repo for
+this before transferring anything, and print a loud `WARNING:` to stderr
+naming exactly what's wrong (uncommitted changes, unpushed commits, or a
+branch with no upstream at all) — but by default this is advisory only:
+the warning fires and the transfer still proceeds. Pass `--require-clean`
+to upgrade it to a hard stop: `push`/`handoff` refuse outright, and
+`sync-all` folds any unclean projects it finds into its failure count so
+the sweep exits non-zero. A `not-a-repo` project (or one with a clean,
+fully-pushed repo) never warns — there's nothing to flag.
+
+`handoff`'s check runs in the preflight step, before the remote `claude` is
+stopped, so a `--require-clean` refusal there never strands the remote the
+way a refusal after the stop would.
+
 ## `handoff`: the main workflow (local machine leaving, remote taking over)
 
 Running `claude-roam handoff <sid>` on its own only moves the JSONL and

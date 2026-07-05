@@ -27,6 +27,8 @@
 #   --force           Skip the newer-side mtime check
 #   --no-extras       Skip the sync-extras step inside handoff / handback
 #   --no-stop         handback: do not stop a running remote claude first
+#   --require-clean   Refuse (instead of warn) if a session's project repo
+#                     has uncommitted or unpushed work
 #   -h, --help        Show this help
 #
 # Config: ${XDG_CONFIG_HOME:-~/.config}/claude-roam/config (sourced shell).
@@ -317,7 +319,7 @@ refuse_if_dest_shrinks() {
 # ---- push / pull ----
 
 cmd_push() {
-  local sid="$1" local_file local_dir local_name remote_name remote_dir remote_file cmp pre post
+  local sid="$1" local_file local_dir local_name remote_name remote_dir remote_file cmp pre post lcwd
   require_remote
   local_file="$(find_local_session "$sid")"
   local_dir="$(dirname "$local_file")"
@@ -326,6 +328,20 @@ cmd_push() {
   remote_dir="$RPROJECTS/$remote_name"
   remote_file="$remote_dir/${sid}.jsonl"
   validate_path "$remote_file"
+
+  # git moves the session's CODE separately from this JSONL transfer -- warn
+  # (or, with --require-clean, refuse) if the project repo isn't fully
+  # committed and pushed. A session with no discoverable cwd (or one whose
+  # cwd isn't a repo) has nothing to check, so failure to resolve it here
+  # must never break the push itself.
+  lcwd="$(session_cwd_local "$sid" 2>/dev/null || true)"
+  if [ -n "$lcwd" ]; then
+    if ! warn_repo_unclean "$lcwd" "$lcwd"; then
+      if [ "${REQUIRE_CLEAN:-0}" -eq 1 ]; then
+        die "refusing to push: project repo at $lcwd is not clean (see WARNING above) — commit and push it, or drop --require-clean to proceed anyway"
+      fi
+    fi
+  fi
 
   cmp="$(compare_mtimes "$local_file" "$remote_file")"
   log "local : $local_file"
@@ -462,6 +478,94 @@ cmd_project() {
     remote) session_cwd_remote "$sid"; echo ;;
     *) die "project: unknown mode '$mode' (use 'local' or 'remote')" ;;
   esac
+}
+
+# git moves a session's CODE separately from the JSONL claude-roam
+# transfers -- if the project repo at <cwd> has uncommitted or unpushed
+# work, a synced session can end up referencing code that isn't reachable
+# on the other machine yet. Sets the global REPO_STATE to exactly one of:
+#   clean       no uncommitted changes, and (if the branch has an upstream)
+#               fully pushed to it
+#   dirty       uncommitted changes present (staged, unstaged, or untracked)
+#   unpushed    clean, but the current branch is ahead of its upstream
+#   no-upstream clean, but the branch has no upstream at all -- the code
+#               isn't confirmed to be on any remote
+#   not-a-repo  <cwd> exists but is not a git repo
+#   no-dir      <cwd> does not exist
+# If the repo is BOTH dirty and ahead of (or missing) an upstream,
+# REPO_STATE reports "dirty" (the more urgent condition) but REPO_UNPUSHED=1
+# is also set, so a caller can mention both conditions in one message.
+# REPO_AHEAD_COUNT is the commit count ahead of upstream (0 if not
+# applicable) so callers can report "N unpushed commit(s)".
+repo_sync_state() {
+  local cwd="$1" upstream
+  REPO_STATE=""
+  REPO_UNPUSHED=0
+  REPO_AHEAD_COUNT=0
+  if [ ! -d "$cwd" ]; then
+    REPO_STATE="no-dir"
+    return 0
+  fi
+  if ! git -C "$cwd" rev-parse --show-toplevel >/dev/null 2>&1; then
+    REPO_STATE="not-a-repo"
+    return 0
+  fi
+  if [ -n "$(git -C "$cwd" status --porcelain 2>/dev/null)" ]; then
+    REPO_STATE="dirty"
+  fi
+  upstream="$(git -C "$cwd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || true
+  if [ -z "$upstream" ]; then
+    if [ "$REPO_STATE" = "dirty" ]; then
+      REPO_UNPUSHED=1
+    else
+      REPO_STATE="no-upstream"
+    fi
+  else
+    REPO_AHEAD_COUNT="$(git -C "$cwd" rev-list --count '@{u}..HEAD' 2>/dev/null)" || REPO_AHEAD_COUNT=""
+    case "$REPO_AHEAD_COUNT" in ''|*[!0-9]*) REPO_AHEAD_COUNT=0 ;; esac
+    if [ "$REPO_AHEAD_COUNT" -gt 0 ]; then
+      if [ "$REPO_STATE" = "dirty" ]; then
+        REPO_UNPUSHED=1
+      else
+        REPO_STATE="unpushed"
+      fi
+    fi
+  fi
+  [ -n "$REPO_STATE" ] || REPO_STATE="clean"
+  return 0
+}
+
+# Advisory warning (never a hard failure -- the caller decides via
+# REQUIRE_CLEAN) that <cwd>'s repo (named <label> in the message) has
+# uncommitted or unpushed work, printed prominently to STDERR so it isn't
+# lost among the normal STDOUT transfer log. Returns 1 if it warned, 0 if
+# the repo is clean, not a repo, or missing (nothing to warn about).
+warn_repo_unclean() {
+  local cwd="$1" label="$2" detail=""
+  repo_sync_state "$cwd"
+  case "$REPO_STATE" in
+    clean|not-a-repo|no-dir) return 0 ;;
+  esac
+  case "$REPO_STATE" in
+    dirty)
+      detail="has uncommitted changes"
+      if [ "$REPO_UNPUSHED" -eq 1 ]; then
+        if [ "$REPO_AHEAD_COUNT" -gt 0 ]; then
+          detail="$detail and $REPO_AHEAD_COUNT unpushed commit(s)"
+        else
+          detail="$detail and its branch has no upstream"
+        fi
+      fi
+      ;;
+    unpushed)    detail="has $REPO_AHEAD_COUNT unpushed commit(s)" ;;
+    no-upstream) detail="is on a branch with no upstream (its code isn't confirmed to be on any remote)" ;;
+  esac
+  {
+    printf 'WARNING: %s %s\n' "$label" "$detail"
+    printf '  the synced session may reference code that is not on the other machine.\n'
+    printf '  commit & push it first, or re-run with --require-clean to make this a hard stop.\n'
+  } >&2
+  return 1
 }
 
 cmd_repo_status() {
@@ -720,6 +824,7 @@ EOF
 cmd_sync_all() {
   local direction="${1:-both}" name rname ldir rdir rel sub
   local sdirs sdirs_rc=0 prels prels_rc=0
+  local unclean_rels="" unclean_n
   case "$direction" in both|to-remote|from-remote) ;; *) die "sync-all: direction must be both|to-remote|from-remote" ;; esac
   require_remote
   FAILED_N=0
@@ -774,6 +879,17 @@ EOF
         fi
       done
     fi
+    # git moves each project's CODE separately from what sync-all moves
+    # here (sessions + .claude extras) -- flag any project whose repo has
+    # uncommitted or unpushed work so its session(s) aren't silently synced
+    # alongside code that isn't reachable on the other machine.
+    repo_sync_state "$HOME/$rel"
+    case "$REPO_STATE" in
+      dirty|unpushed|no-upstream)
+        unclean_rels="$unclean_rels  $rel: $REPO_STATE
+"
+        ;;
+    esac
     log "  $rel"
   done <<EOF
 $prels
@@ -790,6 +906,17 @@ EOF
       fi
       log "  $rel"
     done
+  fi
+
+  if [ -n "$unclean_rels" ]; then
+    unclean_n="$(printf '%s' "$unclean_rels" | grep -c .)"
+    {
+      printf 'WARNING: %s project(s) have uncommitted or unpushed work — their sessions may reference code not on the other machine:\n' "$unclean_n"
+      printf '%s' "$unclean_rels"
+    } >&2
+    if [ "${REQUIRE_CLEAN:-0}" -eq 1 ]; then
+      FAILED_N=$((FAILED_N+unclean_n))
+    fi
   fi
 
   if [ "$FAILED_N" -gt 0 ]; then
@@ -925,6 +1052,16 @@ cmd_handoff() {
   lcwd="$(session_cwd_local "$sid")"
   if git -C "$lcwd" rev-parse --abbrev-ref HEAD >/dev/null 2>&1; then
     lbranch="$(git -C "$lcwd" rev-parse --abbrev-ref HEAD)"
+  fi
+
+  # git moves the session's CODE separately from the JSONL handoff transfers
+  # -- warn (or, with --require-clean, refuse) if the local project repo
+  # isn't fully committed and pushed. This still runs BEFORE the remote
+  # writer is stopped, so a --require-clean refusal never strands it.
+  if ! warn_repo_unclean "$lcwd" "$lcwd"; then
+    if [ "${REQUIRE_CLEAN:-0}" -eq 1 ]; then
+      die "refusing to hand off: project repo at $lcwd is not clean (see WARNING above) — commit and push it, or drop --require-clean to proceed anyway (remote claude was NOT stopped)"
+    fi
   fi
 
   # 3. Stop the remote writer; from here on, any failure must restart it.
@@ -1085,7 +1222,7 @@ EOF
 # ---- arg parsing / main ----
 
 parse_args() {
-  REMOTE_FLAG=""; FORCE=0; NO_EXTRAS=0; NO_STOP=0
+  REMOTE_FLAG=""; FORCE=0; NO_EXTRAS=0; NO_STOP=0; REQUIRE_CLEAN=0
   PARSED=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1094,6 +1231,7 @@ parse_args() {
       --force)     FORCE=1; shift ;;
       --no-extras) NO_EXTRAS=1; shift ;;
       --no-stop)   NO_STOP=1; shift ;;
+      --require-clean) REQUIRE_CLEAN=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       --)          shift; PARSED+=("$@"); break ;;
       *)           PARSED+=("$1"); shift ;;
