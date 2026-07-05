@@ -200,6 +200,21 @@ validate_path() {
   esac
 }
 
+# Preflight wrapper for validate_path used by handoff/handback BEFORE they
+# stop the remote claude: run the check in a subshell so its die doesn't
+# exit us mid-message, then re-die with the original reason plus an explicit
+# reassurance that the remote writer was never touched. Without this, a
+# space/metachar path sails through the cwd preflight, the remote is
+# stopped, and only THEN does cmd_push/cmd_pull's validate_path die --
+# stranding a stopped remote with no transfer and no resume hint.
+_preflight_validate_path() {
+  local err rc=0
+  err="$( (validate_path "$1") 2>&1 )" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "${err#error: } (remote claude was NOT stopped)"
+  fi
+}
+
 # ---- sessions / compare ----
 
 find_local_session() {
@@ -434,8 +449,14 @@ cmd_pull() {
 # carriage return. Excluding embedded newlines is what makes the plain
 # newline-delimited framing safe: a crafted `"evil\n/other"` cwd is dropped
 # rather than split into a phantom second candidate. A legitimate project
-# cwd never contains a newline. Used verbatim on both the local machine and
-# (via remote_sh) the remote, so both sides frame candidates identically.
+# cwd never contains a newline. Requires a REAL JSON parser (jq or python3):
+# the old grep/sed fallback scanned physical lines with no JSON framing, so
+# a torn record (raw newline inside a JSON string) could emit a phantom cwd
+# that silently resolves to the WRONG directory. With neither parser present
+# the snippet exits 3 with an install hint; callers surface that as a hard,
+# actionable failure instead of "no candidates". Used verbatim on both the
+# local machine and (via remote_sh) the remote, so the two parser modes
+# frame candidates identically on both sides.
 cwd_extract_script() {
 cat <<'SH'
 f="$1"
@@ -456,15 +477,25 @@ with open(sys.argv[1]) as fh:
                 print(c)
 ' "$f" 2>/dev/null
 else
-  grep -oE '"cwd":"/[^"\\]*"' "$f" 2>/dev/null | sed -E 's/^"cwd":"//; s/"$//'
+  echo "cwd resolution requires jq or python3; install one" >&2
+  exit 3
 fi
 SH
 }
 
-# Run the extractor locally against $1. Always exits 0 (a missing tool /
-# no-match must read as "no candidates", never as a pipeline failure that
-# `set -o pipefail` would surface to the resolver below).
-_extract_cwd_candidates() { bash -c "$(cwd_extract_script)" _ "$1" 2>/dev/null || true; }
+# Run the extractor locally against $1. A missing JSON parser is a hard,
+# actionable failure (the snippet exits 3; die here with the install hint).
+# Any other nonzero (unreadable file / no matches) still reads as "no
+# candidates", so the resolver's own "no cwd record matches" diagnostic
+# fires instead of a spurious pipeline failure.
+_extract_cwd_candidates() {
+  local out rc=0
+  out="$(bash -c "$(cwd_extract_script)" _ "$1" 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 3 ]; then
+    die "cwd resolution requires jq or python3; install one"
+  fi
+  printf '%s' "$out"
+}
 
 # Validate one candidate is an absolute, lexically-normal path. Strips a
 # single trailing slash (harmless) but REFUSES '//', '/./', '/../', and bare
@@ -557,10 +588,14 @@ _resolve_cwd_stream() {
 # Authoritative LOCAL project cwd for a session: resolve the JSONL's cwd
 # records against the (correctly-translated) local parent directory name.
 session_cwd_local() {
-  local sid="$1" file parent out rc=0
+  local sid="$1" file parent cands out rc=0
   file="$(find_local_session "$sid")"
   parent="$(basename "$(dirname "$file")")"
-  out="$(_extract_cwd_candidates "$file" | _resolve_cwd_stream "$parent")" || rc=$?
+  # Extraction runs OUTSIDE the resolve pipeline so a die inside it (missing
+  # jq/python3) surfaces as this function's own failure with its message
+  # intact, instead of being flattened into "no cwd record matches" below.
+  cands="$(_extract_cwd_candidates "$file")" || return $?
+  out="$(printf '%s' "$cands" | _resolve_cwd_stream "$parent")" || rc=$?
   if [ "$rc" -eq 2 ]; then
     die "session $sid has cwd records resolving to different local project dirs; refusing to guess (project '$parent')"
   fi
@@ -1154,6 +1189,11 @@ cmd_handoff() {
   # 2. PREFLIGHT before stopping anything (a refusal here must not strand the remote).
   local_file="$(find_local_session "$sid")"
   remote_file="$RPROJECTS/$(translate_dir "$(basename "$(dirname "$local_file")")" to-remote)/${sid}.jsonl"
+  # The push's rsync remote operand must pass validate_path -- check it HERE,
+  # before the stop, so a space/metachar path refuses while the remote claude
+  # is still running instead of dying inside cmd_push after it (the recovery
+  # trap would restart it, but never stopping is strictly safer).
+  _preflight_validate_path "$remote_file"
   cmp="$(compare_mtimes "$local_file" "$remote_file")"
   if [ "$cmp" = "remote-unknown" ]; then
     die "could not determine remote state (ssh/stat failed); refusing to proceed (remote claude was NOT stopped)"
@@ -1230,7 +1270,7 @@ cmd_handoff() {
 
 cmd_handback() {
   local sid="$1" pane_info pane="" remote_file local_file cmp
-  local hb_lcwd="" hb_rcwd="" lparent hb_rc=0 extras_rc=0
+  local hb_lcwd="" hb_rcwd="" lparent hb_cands hb_rc=0 extras_rc=0
   require_remote
 
   # 1. Locate the remote pane (mirrors handoff step 1).
@@ -1246,6 +1286,11 @@ cmd_handback() {
   # 2. PREFLIGHT before stopping anything (a refusal here must not strand the remote).
   remote_file="$(find_remote_session "$sid")"
   local_file="$PROJECTS/$(translate_dir "$(basename "$(dirname "$remote_file")")" to-local)/${sid}.jsonl"
+  # The pull's rsync remote operand must pass validate_path -- check it HERE,
+  # before the stop, so a space/metachar path refuses while the remote claude
+  # is still running instead of dying inside cmd_pull after it (which would
+  # strand a stopped remote AND skip the resume hint below).
+  _preflight_validate_path "$remote_file"
   cmp="$(compare_mtimes "$local_file" "$remote_file")"
   if [ "$cmp" = "remote-unknown" ]; then
     die "could not determine remote state (ssh/stat failed); refusing to proceed (remote claude was NOT stopped)"
@@ -1266,13 +1311,31 @@ cmd_handback() {
   # carried into the post-pull extras step (no re-parsing of mutable data).
   if [ "$NO_EXTRAS" -ne 1 ]; then
     lparent="$(translate_dir "$(basename "$(dirname "$remote_file")")" to-local)"
-    hb_lcwd="$(remote_sh "$(cwd_extract_script)" "$remote_file" | _resolve_cwd_stream "$lparent")" || hb_rc=$?
+    # Extraction runs separately from the resolve pipeline so the snippet's
+    # "no jq/python3 on the remote" sentinel (exit 3) can surface as its own
+    # actionable refusal instead of a generic "could not resolve".
+    hb_cands="$(remote_sh "$(cwd_extract_script)" "$remote_file")" || hb_rc=$?
+    if [ "$hb_rc" -eq 3 ]; then
+      die "cwd resolution requires jq or python3 on the remote; install one there (remote claude was NOT stopped). Re-run with --no-extras to pull the transcript only"
+    fi
+    hb_rc=0
+    hb_lcwd="$(printf '%s' "$hb_cands" | _resolve_cwd_stream "$lparent")" || hb_rc=$?
     if [ "$hb_rc" -ne 0 ] || [ -z "$hb_lcwd" ]; then
       die "could not resolve the session's project dir from the remote transcript (project '$lparent'); refusing to hand back (remote claude was NOT stopped). Re-run with --no-extras to pull the transcript only"
     fi
+    # Extras sync requires an under-$HOME project. An outside-$HOME candidate
+    # can slip through resolution via the '/'<->'-' encoding collision (e.g.
+    # /Users-alice/code/app direct-encodes to an under-home parent) but has
+    # no remote counterpart -- session_cwd_remote refuses such a cwd -- so
+    # refuse it HERE, before the stop, instead of failing after stop+pull.
+    # This case is exhaustive: hb_rcwd is always non-empty past this point.
     case "$hb_lcwd" in
       "$HOME"|"$HOME"/*) hb_rcwd="$RHOME${hb_lcwd#"$HOME"}" ;;
+      *) die "resolved project dir '$hb_lcwd' is outside local \$HOME; extras cannot be mapped to the remote (remote claude was NOT stopped). Re-run with --no-extras to pull the transcript only" ;;
     esac
+    # The extras rsync remote operands derive from this path -- same
+    # before-the-stop validation as the transcript path above.
+    _preflight_validate_path "$hb_rcwd"
   fi
 
   # 3. Stop the remote writer — pulling while it writes tears the copy.
@@ -1286,10 +1349,13 @@ cmd_handback() {
   # above already adjudicated.
   FORCE=1 cmd_pull "$sid"
   if [ "$NO_EXTRAS" -ne 1 ]; then
-    # Pass the pre-validated cwd forward (hb_rcwd may be "" for a cwd outside
-    # $HOME -- cmd_sync_extras then derives it from the now-local transcript,
-    # whose bytes are identical to the remote source we already validated).
-    cmd_sync_extras "$sid" from-remote "$hb_lcwd" "$hb_rcwd" || extras_rc=$?
+    # Pass the pre-validated cwds forward (both guaranteed non-empty: the
+    # preflight above refused outside-$HOME cwds, so extras never re-parse
+    # mutable data). Run in a SUBSHELL so even a die/exit inside extras is
+    # captured as extras_rc rather than exiting the shell -- the transcript
+    # is already safely local, and the resume hint below must always print
+    # after a successful pull.
+    ( cmd_sync_extras "$sid" from-remote "$hb_lcwd" "$hb_rcwd" ) || extras_rc=$?
   fi
   log ""
   log "to resume locally, cd to the matching project dir and run:"
@@ -1321,8 +1387,8 @@ cmd_doctor() {
   done
   if command -v tmux >/dev/null 2>&1; then _dr_ok "tmux present"; else _dr_warn "tmux missing (handoff pane restart unavailable)"; fi
   if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
-    _dr_ok "jq or python3 present (robust JSONL cwd parsing)"
-  else _dr_warn "no jq/python3 — cwd parsing falls back to grep (paths with escapes may misparse)"; fi
+    _dr_ok "jq or python3 present (JSONL cwd resolution)"
+  else _dr_warn "no jq/python3 — cwd resolution requires one; project/handoff/handback/sync-extras will fail until jq or python3 is installed"; fi
   # Capture then log — piping into `while read` would run the loop in a
   # subshell, discarding anything it sets (see the remote block below).
   local rsync_ver
@@ -1353,6 +1419,11 @@ done
 rsync_ver=$(rsync --version 2>/dev/null | head -1)
 if [ -n "$rsync_ver" ]; then echo "     remote rsync: $rsync_ver"; fi
 if command -v tmux >/dev/null 2>&1; then echo "ok   remote tmux present"; else echo "warn remote tmux missing"; fi
+if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  echo "ok   remote jq or python3 present (JSONL cwd resolution)"
+else
+  echo "warn remote jq/python3 missing — handback cwd resolution will fail; install one on the remote"
+fi
 if [ -d "$1" ]; then echo "ok   remote projects dir $1"; else echo "warn remote projects dir missing: $1 (run Claude Code once there)"; fi' "$RPROJECTS")"
     while IFS= read -r line; do
       [ -n "$line" ] || continue

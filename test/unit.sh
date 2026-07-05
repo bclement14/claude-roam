@@ -782,4 +782,177 @@ assert_match "H6.22 handoff attempted restart after the failure" "restart" "$(ca
 unset -f require_remote find_local_session find_remote_pane compare_mtimes \
   session_cwd_local session_cwd_remote stop_remote_claude cmd_push remote_sh restart_remote_claude
 
+# ---- H6 audit fixes: D1 (jq/python3 required for cwd extraction), ----
+# ---- D2 (validate transfer paths BEFORE the remote stop),          ----
+# ---- D3 (reject outside-$HOME handback cwd before the stop)        ----
+# Prior blocks unset -f'd real functions; re-source to restore the genuine
+# implementations before layering test-local stubs on top.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+LHP="$(encode_path "$HOME")"
+
+# -- D1: the cwd extractor must be a real JSON parser. A torn record (raw
+# -- physical newline inside a JSON string) must refuse under jq and python3,
+# -- and with NEITHER parser on PATH resolution must die with an install hint
+# -- instead of grep-scanning line fragments into a phantom (wrong-directory)
+# -- cwd. The torn fixture's second physical line looks like a cwd for
+# -- code-my/app, which direct-encodes to this parent via the '/'<->'-'
+# -- collision -- the legitimate project for the parent is code/my-app.
+D1DIR="$PROJECTS/$LHP-code-my-app"; mkdir -p "$D1DIR"
+printf '{"cwd":"evil\n"cwd":"%s/code-my/app"}\n' "$HOME" > "$D1DIR/d1torn.jsonl"
+printf '{"cwd":"%s/code/my-app"}\n' "$HOME" > "$D1DIR/d1ctl.jsonl"
+
+# Restricted-PATH mode dirs: symlink ONLY the binaries the resolution path
+# needs (sed is included so the OLD grep|sed fallback is genuinely runnable
+# in no-parser mode -- proving the fix removed it, not that sed was missing).
+D1BIN="$TMP/d1bins"
+d1_mode_dir() { # $1 = mode name, $2.. = parser binaries to include
+  local d="$D1BIN/$1" t; shift
+  mkdir -p "$d"
+  for t in bash cat find grep sed tr dirname basename "$@"; do
+    ln -sf "$(command -v "$t")" "$d/$t"
+  done
+  printf '%s' "$d"
+}
+d1_run() { # $1 = mode dir, $2 = sid: session_cwd_local under a clean env
+  env -i HOME="$HOME" PATH="$1" bash -c \
+    ". '$REPO_DIR/bin/claude-roam'; PROJECTS='$PROJECTS'; session_cwd_local '$2'" 2>&1
+}
+
+if command -v jq >/dev/null 2>&1; then
+  D1JQ="$(d1_mode_dir jq jq)"
+  rc=0; out="$(d1_run "$D1JQ" d1ctl)" || rc=$?
+  assert_rc "D1 jq mode resolves the well-formed control" 0 "$rc"
+  assert_eq "D1 jq mode control resolves to the real project" "$HOME/code/my-app" "$out"
+  rc=0; out="$(d1_run "$D1JQ" d1torn)" || rc=$?
+  assert_rc "D1 jq mode refuses the torn record" 1 "$rc"
+  case "$out" in *code-my/app*) t_fail "D1 jq mode must not emit the phantom cwd" "$out" ;; *) t_ok "D1 jq mode does not emit the phantom cwd" ;; esac
+else
+  t_ok "D1 jq-mode tests skipped (no jq on PATH)"
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  D1PY="$(d1_mode_dir py python3)"
+  rc=0; out="$(d1_run "$D1PY" d1ctl)" || rc=$?
+  assert_rc "D1 python3 mode resolves the well-formed control" 0 "$rc"
+  assert_eq "D1 python3 mode control resolves to the real project" "$HOME/code/my-app" "$out"
+  rc=0; out="$(d1_run "$D1PY" d1torn)" || rc=$?
+  assert_rc "D1 python3 mode refuses the torn record" 1 "$rc"
+  case "$out" in *code-my/app*) t_fail "D1 python3 mode must not emit the phantom cwd" "$out" ;; *) t_ok "D1 python3 mode does not emit the phantom cwd" ;; esac
+else
+  t_ok "D1 python3-mode tests skipped (no python3 on PATH)"
+fi
+
+D1NONE="$(d1_mode_dir none)"
+rc=0; out="$(d1_run "$D1NONE" d1ctl)" || rc=$?
+assert_rc "D1 no-parser mode dies instead of resolving (control)" 1 "$rc"
+assert_match "D1 no-parser death carries the install hint" "requires jq or python3" "$out"
+rc=0; out="$(d1_run "$D1NONE" d1torn)" || rc=$?
+assert_rc "D1 no-parser mode dies instead of resolving (torn)" 1 "$rc"
+case "$out" in *code-my/app*) t_fail "D1 no-parser mode must not emit the phantom cwd" "$out" ;; *) t_ok "D1 no-parser mode does not emit the phantom cwd" ;; esac
+
+# D1 remote side: a remote extractor exiting 3 (no jq/python3 THERE) must
+# surface handback's own actionable hint, still before the stop.
+HB3STOP="$TMP/hb3_stop"; : > "$HB3STOP"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/hb3.jsonl"; }
+find_remote_pane() { printf 'OK main:1.0'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$HB3STOP"; }
+cmd_pull() { echo pull >> "$HB3STOP"; }
+remote_sh() { return 3; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handback hb3) 2>&1 )" || rc=$?
+assert_rc "D1 handback dies when the remote lacks jq/python3" 1 "$rc"
+assert_match "D1 remote-parser death carries the install hint" "jq or python3 on the remote" "$out"
+assert_eq "D1 remote-parser death happens before the stop" "" "$(cat "$HB3STOP")"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes stop_remote_claude cmd_pull remote_sh
+
+# -- D2: a space-containing transfer path must refuse BEFORE the remote stop,
+# -- in BOTH handback and handoff (the encoded project dir keeps every char
+# -- of the cwd except '/', so a space in the cwd puts a space in the path
+# -- rsync would receive -- previously only caught inside cmd_pull/cmd_push,
+# -- AFTER stop_remote_claude).
+D2STOP="$TMP/d2hb_stop"; : > "$D2STOP"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my app/d2s.jsonl"; }
+find_remote_pane() { printf 'OK main:1.0'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$D2STOP"; }
+cmd_pull() { echo pull >> "$D2STOP"; }
+NO_STOP=0; NO_EXTRAS=1; FORCE=0
+rc=0; out="$( (cmd_handback d2s) 2>&1 )" || rc=$?
+assert_rc "D2 handback refuses a space-containing remote path" 1 "$rc"
+assert_match "D2 handback refusal says the remote was not stopped" "NOT stopped" "$out"
+assert_eq "D2 handback neither stopped nor pulled after the refusal" "" "$(cat "$D2STOP")"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes stop_remote_claude cmd_pull
+NO_EXTRAS=0
+
+D2HOSTOP="$TMP/d2ho_stop"; : > "$D2HOSTOP"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_local_session() { printf '%s' "$PROJECTS/$LHP-code-my app/d2h.jsonl"; }
+find_remote_pane() { printf 'OK main:1.0'; }
+compare_mtimes() { printf 'local-newer'; }
+session_cwd_local() { printf '%s/code/my app' "$HOME"; }
+stop_remote_claude() { echo stop >> "$D2HOSTOP"; }
+cmd_push() { echo push >> "$D2HOSTOP"; }
+cmd_repo_pull() { :; }
+cmd_sync_extras() { :; }
+restart_remote_claude() { :; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handoff d2h) 2>&1 )" || rc=$?
+assert_rc "D2 handoff refuses a space-containing remote path" 1 "$rc"
+assert_match "D2 handoff refusal says the remote was not stopped" "NOT stopped" "$out"
+assert_eq "D2 handoff neither stopped nor pushed after the refusal" "" "$(cat "$D2HOSTOP")"
+unset -f require_remote find_local_session find_remote_pane compare_mtimes \
+  session_cwd_local stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras restart_remote_claude
+
+# D2 belt-and-suspenders: a die INSIDE the post-pull extras step must not
+# skip the local resume hint -- the transcript is already safely local.
+HINTLOG="$TMP/d2hint_calls"; : > "$HINTLOG"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/hbe.jsonl"; }
+find_remote_pane() { printf 'OK main:1.0'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$HINTLOG"; }
+cmd_pull() { echo pull >> "$HINTLOG"; }
+remote_sh() { printf '/home/alice/code/my-app\n'; }
+cmd_sync_extras() { die "extras exploded"; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handback hbe) 2>&1 )" || rc=$?
+assert_rc "D2 handback propagates an extras die as nonzero" 1 "$rc"
+assert_match "D2 resume hint still prints when extras die" "to resume locally" "$out"
+assert_match "D2 extras-failure warning still prints" "WARNING" "$out"
+assert_match "D2 pull completed before the extras failure" "pull" "$(cat "$HINTLOG")"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes \
+  stop_remote_claude cmd_pull remote_sh cmd_sync_extras
+
+# -- D3: the '/'<->'-' collision lets an outside-$HOME candidate direct-encode
+# -- to an under-home parent; the resolver accepts it (documented mechanism)...
+rc=0; out="$(_resolve_cwd_candidate "/Users-alice/code/app" "-Users-alice-code-app" "-Users-alice")" || rc=$?
+assert_rc "D3 resolver accepts the collision candidate (mechanism)" 0 "$rc"
+assert_eq "D3 resolver returns the collision candidate as-is" "/Users-alice/code/app" "$out"
+
+# ...so handback's preflight must refuse the resolved outside-$HOME cwd
+# BEFORE the stop (previously: empty hb_rcwd, stop, pull, extras failure).
+# The stub emits "$HOME-code/app", which direct-encodes to the translated
+# parent "$LHP-code-app" yet is a sibling of $HOME, not under it.
+D3STOP="$TMP/d3_stop"; : > "$D3STOP"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-app/d3s.jsonl"; }
+find_remote_pane() { printf 'OK main:1.0'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$D3STOP"; }
+cmd_pull() { echo pull >> "$D3STOP"; }
+remote_sh() { printf '%s-code/app\n' "$HOME"; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handback d3s) 2>&1 )" || rc=$?
+assert_rc "D3 handback refuses an outside-\$HOME resolved cwd" 1 "$rc"
+assert_match "D3 refusal names the outside-home problem" "outside" "$out"
+assert_match "D3 refusal says the remote was not stopped" "NOT stopped" "$out"
+assert_eq "D3 handback neither stopped nor pulled after the refusal" "" "$(cat "$D3STOP")"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes \
+  stop_remote_claude cmd_pull remote_sh
+
 t_summary
