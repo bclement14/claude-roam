@@ -118,6 +118,47 @@ claude-roam doctor                   check prerequisites (local, and remote if c
 `push --force` overwrites the remote copy, `pull --force` overwrites the
 local copy.
 
+## How this compares
+
+There are two common ways people sync Claude Code across machines. Both
+are reasonable — they just solve a different problem than `claude-roam`
+does.
+
+- **Config + project sync over a NAS or Syncthing.** Share the `~/.claude`
+  config (settings, skills, commands) via a network share or peer sync,
+  and project files via a tool like Syncthing. This gives you instant
+  config sharing and full local copies of every project. It typically
+  doesn't sync *sessions*, though — conversation history stays on the
+  machine it was recorded on — and it assumes absolute paths match across
+  machines, which breaks when usernames or home directories differ.
+- **Whole-`~/.claude` sync through encrypted cloud storage.** Encrypt the
+  entire `~/.claude` directory (sessions, history, config) and sync it
+  through a cloud bucket — e.g. `age` encryption to S3/R2/GCS. This covers
+  everything, sessions included, with strong at-rest encryption. But it
+  typically has no conflict-resolution or live-session story, no path
+  translation between differing `$HOME`s (a session recorded under
+  `/Users/alice` lands in a directory the other machine won't look in
+  under `/home/alice`), and your conversation data transits a third-party
+  bucket.
+
+`claude-roam` sits in the gap between the two. It targets sessions
+specifically, and it translates the encoded-cwd directory name across
+differing `$HOME`s — the piece the other two approaches skip. Conflicts
+are explicit refusal states (newer-side, diverged, remote-unknown, and the
+size-shrink guard) instead of silent last-writer-wins or `.sync-conflict`
+files, and transfers go machine-to-machine over your own ssh — no
+third-party infrastructure, so conversation data never leaves your
+machines. The trade-offs are its own: locking is advisory, not real; it's
+hub-and-spoke (run it from the machine that can ssh out); and it moves one
+session at a time on purpose rather than running as a daemon — see
+[Honest limits](#honest-limits) below. One thing no approach changes:
+sessions can contain secrets, so a session JSONL is never safe to commit
+or publish, however you move it.
+
+For worked examples of the first two approaches, see
+[this NAS/Syncthing setup](https://www.steeman.be/posts/syncing-claude-code-across-multiple-machines/)
+and [this encrypted-cloud setup](https://medium.com/codex/sync-your-claude-code-sessions-across-all-devices-2e407c2eb160).
+
 ## Honest limits
 
 - **Advisory locking, not real locking.** `claude-roam` compares mtimes
