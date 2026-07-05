@@ -213,9 +213,10 @@ find_remote_session() {
   printf '%s' "$path"
 }
 
-# Portable stat: BSD first, GNU fallback.
-local_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
-local_size()  { stat -f %z "$1" 2>/dev/null || stat -c %s "$1"; }
+# GNU first: BSD stat errors on -c (clean fallback), but GNU stat "succeeds"
+# with filesystem info on -f — so BSD-first silently breaks Linux.
+local_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+local_size()  { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
 
 # One round trip: "<mtime> <size>" or empty if the file doesn't exist.
 remote_stat() {

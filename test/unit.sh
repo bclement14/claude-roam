@@ -77,6 +77,7 @@ assert_match "require_remote guidance mentions --remote" "--remote" "$out"
 SSH_COUNT_FILE="$TMP/sshcount"; : > "$SSH_COUNT_FILE"
 ssh() { echo x >> "$SSH_COUNT_FILE"; printf '/home/alice'; }
 RHOME=""; REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE="stubhost"
+# shellcheck disable=SC2218  # defined by sourcing bin/claude-roam above; later stub redefinition confuses shellcheck
 require_remote; require_remote
 assert_eq "require_remote caches (one ssh for two calls)" "1" "$(grep -c x "$SSH_COUNT_FILE")"
 unset -f ssh
