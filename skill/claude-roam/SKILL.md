@@ -49,7 +49,7 @@ claude-roam handoff  <sid>          stop remote claude + push JSONL + git pull o
                                     + sync extras + restart claude in same tmux pane
 claude-roam handback <sid>          stop remote claude + pull JSONL + sync extras
 claude-roam project  <sid> [remote] print the session's local (or remote) cwd
-claude-roam repo-status <sid>       git status of the local project (if a repo)
+claude-roam repo-status <sid> [remote]  git status of the local (or remote) project (if a repo)
 claude-roam repo-pull   <sid>       git pull --ff-only on the remote project dir
 claude-roam sync-extras <sid> [to-remote|from-remote]
                                     rsync gitignored working dirs (plans, reviews,
@@ -226,11 +226,14 @@ to commit work that lives on the remote — we'd need a claude running
 there. The agent's job here is limited to the remote-dirty-repo check;
 the CLI itself now stops the remote claude before pulling. So:
 
-1. **Check the remote repo state first** (compute the remote path locally,
-   then pass it to ssh — `claude-roam` itself is local-only):
+1. **Check the remote repo state first.** Don't hand-build an ssh command
+   from `claude-roam project <sid> remote`'s output — a pulled JSONL's
+   `cwd` is semi-untrusted (it came from the other machine) and a raw
+   `ssh myserver "cd '$RPATH' ..."` string would let a quote in that path
+   inject into the remote command. Use the dedicated subcommand instead,
+   which passes the path as a quoted argv element:
    ```bash
-   RPATH="$(claude-roam project <sid> remote)"
-   ssh myserver "cd '$RPATH' 2>/dev/null && git status --short --branch || echo 'remote dir missing or not a repo'"
+   claude-roam repo-status <sid> remote
    ```
 2. If the remote repo is dirty → **STOP**. Tell the user to commit on the
    server first (they can ask the running claude on the server to do it,
@@ -242,7 +245,7 @@ the CLI itself now stops the remote claude before pulling. So:
    ```bash
    claude-roam handback <sid>
    ```
-4. **Pull locally**: `cd $(claude-roam project <sid>) && git pull --ff-only`.
+4. **Pull locally**: `cd "$(claude-roam project "<sid>")" && git pull --ff-only`.
 5. Tell the user the `cd … && claude --resume <sid>` command to launch
    locally.
 
@@ -397,7 +400,8 @@ claude-roam recent               # local sessions
 claude-roam list                 # remote sessions
 claude-roam project <sid>        # local cwd of a session
 claude-roam project <sid> remote # remote cwd
-claude-roam repo-status <sid>    # git status of local project
+claude-roam repo-status <sid>        # git status of local project
+claude-roam repo-status <sid> remote # git status of remote project
 claude-roam sync-all             # sync all sessions + per-project .claude extras
 claude-roam doctor               # check prerequisites (local, and remote if configured)
 ```

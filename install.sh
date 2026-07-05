@@ -28,6 +28,7 @@ if [ -f "$CFG" ]; then
 else
   mkdir -p "$CFG_DIR"
   cp "$DIR/examples/config.example" "$CFG"
+  chmod 600 "$CFG"   # sourced as shell — keep it owner-only, per docs/configuration.md
   log "  seeded $CFG — EDIT IT: set CLAUDE_ROAM_REMOTE to your SSH host alias"
 fi
 

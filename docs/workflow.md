@@ -83,10 +83,12 @@ restart it by hand is printed.
 running on the remote side to dispatch a commit through — the repo-commit
 step of `handoff` requires a Claude agent to run *in the project
 directory*, and that directory is remote. So before running
-`claude-roam handback <sid>`, check the remote repo state over SSH first
-(`git status --short --branch` in the remote project directory) — if it's
-dirty, stop and get it committed on the remote side before pulling
-anything.
+`claude-roam handback <sid>`, check the remote repo state first —
+`claude-roam repo-status <sid> remote` resolves the remote project path and
+runs `git status --short --branch` there over SSH, passing the path as a
+quoted argv element rather than interpolating it into a hand-built SSH
+command — if it's dirty, stop and get it committed on the remote side
+before pulling anything.
 
 Once the remote repo is clean (or isn't a git repo at all):
 
@@ -101,7 +103,7 @@ copy. It then pulls the JSONL and syncs extras `from-remote`. It does
 finishes:
 
 ```bash
-cd $(claude-roam project <sid>) && git pull --ff-only
+cd "$(claude-roam project "<sid>")" && git pull --ff-only
 ```
 
 Pass `--no-stop` only when you know the remote isn't actively running the

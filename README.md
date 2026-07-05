@@ -95,7 +95,7 @@ claude-roam handoff  <sid>           stop remote claude + push JSONL + git pull 
                                       + sync extras + restart claude in same tmux pane
 claude-roam handback <sid>           stop remote claude + pull JSONL + sync extras
 claude-roam project  <sid> [remote]  print the session's local (or remote) cwd
-claude-roam repo-status <sid>        git status of the local project (if a repo)
+claude-roam repo-status <sid> [remote] git status of the local (or remote) project (if a repo)
 claude-roam repo-pull   <sid>        git pull --ff-only on the remote project dir
 claude-roam sync-extras <sid> [to-remote|from-remote]
                                       rsync gitignored working dirs for one project/session

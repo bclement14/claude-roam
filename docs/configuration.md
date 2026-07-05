@@ -73,7 +73,8 @@ configuration:
 - `claude-roam recent`
 - `claude-roam project <sid>` (local mode — the default; `project <sid>
   remote` does need a remote)
-- `claude-roam repo-status <sid>`
+- `claude-roam repo-status <sid>` (local mode — the default; `repo-status
+  <sid> remote` does need a remote)
 - `claude-roam -h` / `--help`
 - the local half of `claude-roam doctor` (it prints "no remote configured"
   for the remote half and simply skips it)

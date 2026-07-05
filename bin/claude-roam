@@ -14,7 +14,7 @@
 #   claude-roam handoff  <session-id>    Stop remote claude + push + repo pull + extras + restart
 #   claude-roam handback <session-id>    Stop remote claude + pull + extras
 #   claude-roam project  <session-id> [remote]   Print the session's cwd
-#   claude-roam repo-status <session-id> git status of the local project
+#   claude-roam repo-status <session-id> [remote]  git status of the local (or remote) project
 #   claude-roam repo-pull   <session-id> git pull --ff-only in the remote project dir
 #   claude-roam sync-extras <session-id> [to-remote|from-remote]
 #   claude-roam sync-all    [both|to-remote|from-remote]
@@ -45,6 +45,17 @@ validate_sid() {
   case "$1" in
     ""|*[!A-Za-z0-9._-]*) die "invalid session id: '$1' (allowed: A-Z a-z 0-9 . _ -)" ;;
   esac
+}
+
+# Escape ERE-active characters in a (validated) session id before it is
+# interpolated into a `pgrep -f` extended regex. The sid allowlist is
+# [A-Za-z0-9._-]; of those, only `.` is ERE-active (matches any character) —
+# `-` is not special outside a bracket expression. Wrapping each literal dot
+# in a one-character bracket expression `[.]` makes it match a literal dot
+# only, so a dotted sid like "abc.def" can no longer match an unrelated
+# string like "abcXdef" via the ERE wildcard.
+sid_to_ere() {
+  printf '%s' "$1" | sed 's/\./[.]/g'
 }
 
 validate_int() {
@@ -334,8 +345,12 @@ cmd_push() {
   fi
 
   pre="$(local_mtime "$local_file") $(local_size "$local_file")"
-  remote_sh 'mkdir -p "$1"' "$remote_dir"
-  rsync -a --progress "$local_file" "$REMOTE:$remote_file"
+  remote_sh 'mkdir -p "$1"' "$remote_dir" || return $?
+  # -I/--ignore-times: rsync's default quick-check is size+mtime, so equal
+  # metadata with different bytes (see compare_mtimes' "diverged" verdict,
+  # and equal-metadata cases --force is meant to override) would otherwise
+  # be silently skipped even though we already decided a transfer is wanted.
+  rsync -aI --progress "$local_file" "$REMOTE:$remote_file" || return $?
   post="$(local_mtime "$local_file") $(local_size "$local_file")"
   if [ "$pre" != "$post" ]; then
     log "WARNING: the session file changed during transfer — a Claude is likely still writing it here. Stop it and re-run push."
@@ -376,8 +391,11 @@ cmd_pull() {
     [ -f "$local_file" ] && dest_size="$(local_size "$local_file")"
     refuse_if_dest_shrinks "$(_remote_size_or_empty "$remote_file")" "$dest_size"
   fi
-  mkdir -p "$local_dir"
-  rsync -a --progress "$REMOTE:$remote_file" "$local_file"
+  mkdir -p "$local_dir" || return $?
+  # -I/--ignore-times: see the matching comment in cmd_push — skip rsync's
+  # size+mtime quick-check so an already-adjudicated transfer always sends
+  # the bytes, even when source and destination share size and mtime.
+  rsync -aI --progress "$REMOTE:$remote_file" "$local_file" || return $?
   if [ "$cmp" = "equal" ]; then
     log "already in sync: $sid (no transfer needed)"
   else
@@ -460,6 +478,22 @@ cmd_repo_status() {
   git -C "$cwd" status --short --branch
 }
 
+# Remote counterpart of cmd_repo_status. The remote cwd comes from a pulled
+# JSONL (semi-untrusted -- it originated on another machine), so it MUST be
+# passed to the remote shell as a quoted argv element via remote_sh, never
+# interpolated into a hand-built ssh/rsync command string: a cwd containing
+# a quote or shell metacharacter would otherwise inject into that command
+# (see docs/skill's old raw-ssh recipe, replaced by this subcommand).
+cmd_repo_status_remote() {
+  local sid="$1" rcwd
+  require_remote
+  rcwd="$(session_cwd_remote "$sid")"
+  log "remote: $REMOTE:$rcwd"
+  remote_sh 'cd "$1" 2>/dev/null || { echo "remote dir missing or not a repo"; exit 0; }
+git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "not-a-repo: $1"; exit 0; }
+git status --short --branch' "$rcwd"
+}
+
 cmd_repo_pull() {
   local sid="$1" expected_branch="${2:-}" rcwd
   require_remote
@@ -537,18 +571,27 @@ _sync_to() {
   local src="$1" rdst="$2"
   [ -d "$src" ] || return 0
   validate_path "$rdst"
-  remote_sh 'mkdir -p "$1"' "$rdst" || die "remote mkdir failed for $REMOTE:$rdst"
+  # Explicit `|| return $?` on every fallible step: this function is called
+  # from `sync_try`/`||` contexts that disable `errexit` for its whole
+  # invocation, so a failure must be propagated explicitly, not left to
+  # `set -e` (see the H1 comment on cmd_push).
+  remote_sh 'mkdir -p "$1"' "$rdst" || return $?
   log "  $src/  ->  $REMOTE:$rdst/"
-  rsync -auv "$src/" "$REMOTE:$rdst/"
+  rsync -auv "$src/" "$REMOTE:$rdst/" || return $?
 }
 
 _sync_from() {
-  local rsrc="$1" dst="$2"
+  local rsrc="$1" dst="$2" out
   validate_path "$rsrc"
-  remote_sh '[ -d "$1" ]' "$rsrc" 2>/dev/null || return 0
+  # Two-word sentinel protocol so an ssh/transport failure (remote_sh
+  # returns nonzero) is never confused with "directory genuinely absent"
+  # (remote_sh succeeds and prints NO) -- the old `remote_sh '[ -d "$1" ]'
+  # ... || return 0` collapsed both cases into a silent no-op.
+  out="$(remote_sh '[ -d "$1" ] && echo YES || echo NO' "$rsrc")" || return $?
+  [ "$out" = "YES" ] || return 0
   mkdir -p "$dst"
   log "  $REMOTE:$rsrc/  ->  $dst/"
-  rsync -auv "$REMOTE:$rsrc/" "$dst/"
+  rsync -auv "$REMOTE:$rsrc/" "$dst/" || return $?
 }
 
 cmd_sync_extras() {
@@ -568,17 +611,17 @@ cmd_sync_extras() {
       log "syncing extras: local -> $REMOTE"
       if [ ${#PROJECT_CLAUDE_EXTRAS[@]} -gt 0 ]; then
         for sub in "${PROJECT_CLAUDE_EXTRAS[@]}"; do
-          _sync_to "$lcwd/.claude/$sub" "$rcwd/.claude/$sub"
+          _sync_to "$lcwd/.claude/$sub" "$rcwd/.claude/$sub" || return $?
         done
       fi
       if [ ${#SESSION_DIR_EXTRAS[@]} -gt 0 ]; then
         for sub in "${SESSION_DIR_EXTRAS[@]}"; do
-          _sync_to "$lenc/$sub" "$renc/$sub"
+          _sync_to "$lenc/$sub" "$renc/$sub" || return $?
         done
       fi
       if [ ${#HOME_RELATIVE_EXTRAS[@]} -gt 0 ]; then
         for rel in "${HOME_RELATIVE_EXTRAS[@]}"; do
-          _sync_to "$HOME/$rel" "$RHOME/$rel"
+          _sync_to "$HOME/$rel" "$RHOME/$rel" || return $?
         done
       fi
       ;;
@@ -586,17 +629,17 @@ cmd_sync_extras() {
       log "syncing extras: $REMOTE -> local"
       if [ ${#PROJECT_CLAUDE_EXTRAS[@]} -gt 0 ]; then
         for sub in "${PROJECT_CLAUDE_EXTRAS[@]}"; do
-          _sync_from "$rcwd/.claude/$sub" "$lcwd/.claude/$sub"
+          _sync_from "$rcwd/.claude/$sub" "$lcwd/.claude/$sub" || return $?
         done
       fi
       if [ ${#SESSION_DIR_EXTRAS[@]} -gt 0 ]; then
         for sub in "${SESSION_DIR_EXTRAS[@]}"; do
-          _sync_from "$renc/$sub" "$lenc/$sub"
+          _sync_from "$renc/$sub" "$lenc/$sub" || return $?
         done
       fi
       if [ ${#HOME_RELATIVE_EXTRAS[@]} -gt 0 ]; then
         for rel in "${HOME_RELATIVE_EXTRAS[@]}"; do
-          _sync_from "$RHOME/$rel" "$HOME/$rel"
+          _sync_from "$RHOME/$rel" "$HOME/$rel" || return $?
         done
       fi
       ;;
@@ -621,15 +664,19 @@ sync_try() {
 
 # All encoded session dir names in LOCAL form: local dirs ∪ translated remote
 # dirs (one ssh). Remote dirs outside the remote home prefix are skipped.
+# Return code: 0 if remote discovery succeeded, nonzero if the remote_sh
+# call itself failed (ssh/transport) -- callers MUST check this, since a
+# swallowed discovery failure would silently degrade to a local-only sweep
+# (empty union) while still reporting overall success.
 union_session_dirs() {
-  local d names rnames rn ln
+  local d names rnames rn ln rc=0
   names=""
   for d in "$PROJECTS/$(local_home_encoded)"*; do
     if [ -d "$d" ]; then names="$names$(basename "$d")
 "; fi
   done
   rnames="$(remote_sh 'find "$1" -maxdepth 1 -mindepth 1 -type d -name "$2*" 2>/dev/null | while read -r d; do basename "$d"; done' \
-    "$RPROJECTS" "$(remote_home_encoded)" || true)"
+    "$RPROJECTS" "$(remote_home_encoded)")" || rc=1
   while IFS= read -r rn; do
     [ -n "$rn" ] || continue
     if ln="$(translate_dir "$rn" to-local 2>/dev/null)"; then names="$names$ln
@@ -638,12 +685,15 @@ union_session_dirs() {
 $rnames
 EOF
   printf '%s' "$names" | sort -u | grep . || true
+  return "$rc"
 }
 
 # Relative project paths (e.g. code/proj) under PROJECT_ROOTS that have a
-# .claude dir on either side.
+# .claude dir on either side. Return code mirrors union_session_dirs above:
+# nonzero means at least one remote discovery round failed and the union
+# may be incomplete.
 union_projects() {
-  local root p rel rlist
+  local root p rel rlist rc=0
   local out=""
   if [ ${#PROJECT_ROOTS[@]} -eq 0 ]; then return 0; fi
   for root in "${PROJECT_ROOTS[@]}"; do
@@ -654,7 +704,7 @@ union_projects() {
       fi
     done
     rlist="$(remote_sh 'root="$1"; for p in "$2/$root"/*/; do [ -d "${p}.claude" ] && printf "%s\n" "${p#"$2"/}"; done 2>/dev/null' \
-      "$root" "$RHOME" || true)"
+      "$root" "$RHOME")" || rc=1
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
       out="$out${rel%/}
@@ -664,15 +714,27 @@ $rlist
 EOF
   done
   printf '%s' "$out" | sort -u | grep . || true
+  return "$rc"
 }
 
 cmd_sync_all() {
   local direction="${1:-both}" name rname ldir rdir rel sub
+  local sdirs sdirs_rc=0 prels prels_rc=0
   case "$direction" in both|to-remote|from-remote) ;; *) die "sync-all: direction must be both|to-remote|from-remote" ;; esac
   require_remote
   FAILED_N=0
 
   log "== sessions =="
+  # Capture discovery output AND its exit code outside the `<<EOF ... EOF`
+  # heredoc: `$(union_session_dirs)` there would run in its own command-
+  # substitution subshell, so a nonzero return from it couldn't reach
+  # FAILED_N in this scope at all -- discovery failure has to be checked
+  # right here, before the loop consumes the (possibly incomplete) output.
+  sdirs="$(union_session_dirs)" || sdirs_rc=$?
+  if [ "$sdirs_rc" -ne 0 ]; then
+    FAILED_N=$((FAILED_N+1))
+    log "  WARN: remote discovery failed — union may be incomplete"
+  fi
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     rname="$(translate_dir "$name" to-remote 2>/dev/null)" || continue
@@ -691,10 +753,15 @@ cmd_sync_all() {
     fi
     log "  $name"
   done <<EOF
-$(union_session_dirs)
+$sdirs
 EOF
 
   log "== per-project .claude extras =="
+  prels="$(union_projects)" || prels_rc=$?
+  if [ "$prels_rc" -ne 0 ]; then
+    FAILED_N=$((FAILED_N+1))
+    log "  WARN: remote discovery failed — union may be incomplete"
+  fi
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     if [ ${#PROJECT_CLAUDE_EXTRAS[@]} -gt 0 ]; then
@@ -709,7 +776,7 @@ EOF
     fi
     log "  $rel"
   done <<EOF
-$(union_projects)
+$prels
 EOF
 
   log "== home extras =="
@@ -739,15 +806,18 @@ EOF
 #   stdout = "NOPANE"       no claude --resume <sid> process running
 #   non-zero exit           ssh / remote tooling failed
 find_remote_pane() {
-  local sid="$1" out rc
-  # sid already validated to [A-Za-z0-9._-], so it's safe to interpolate.
+  local sid="$1" sid_re out rc
+  # sid already validated to [A-Za-z0-9._-]; sid_re additionally escapes any
+  # ERE-active `.` so it's safe to interpolate into the pgrep pattern below
+  # (see sid_to_ere).
+  sid_re="$(sid_to_ere "$sid")"
   # rc must be captured explicitly: under `set -e`, `out=$(ssh ...)` failing
   # would otherwise exit the script right here, before `rc=$?` ever runs,
   # making the die below dead code.
   set +e
   out=$(ssh "$REMOTE" "
     set -u
-    cpid=\$(pgrep -f 'claude --resume[= ]${sid}( |\$)' 2>/dev/null | head -1) || true
+    cpid=\$(pgrep -f 'claude --resume[= ]${sid_re}( |\$)' 2>/dev/null | head -1) || true
     if [ -z \"\$cpid\" ]; then
       echo NOPANE
       exit 0
@@ -783,13 +853,15 @@ validate_pane() {
 # Stop the claude running in $pane and wait up to 10s for the pid to clear.
 # Does all polling in a single ssh to avoid 10 round-trips.
 stop_remote_claude() {
-  local sid="$1" pane="$2"
+  local sid="$1" pane="$2" sid_re
+  # See sid_to_ere: escapes ERE-active `.` before it reaches pgrep's pattern.
+  sid_re="$(sid_to_ere "$sid")"
   validate_pane "$pane"
   if ssh "$REMOTE" "
     tmux send-keys -t '$pane' C-c
     for i in 1 2 3 4 5 6 7 8 9 10; do
       sleep 1
-      pgrep -f 'claude --resume[= ]${sid}( |\$)' >/dev/null 2>&1 || exit 0
+      pgrep -f 'claude --resume[= ]${sid_re}( |\$)' >/dev/null 2>&1 || exit 0
       if [ \"\$i\" = 5 ]; then
         tmux send-keys -t '$pane' C-c
       fi
@@ -1036,7 +1108,15 @@ dispatch() {
     push) [ $# -ge 1 ] || die "push needs <session-id>"; validate_sid "$1"; cmd_push "$1" ;;
     pull) [ $# -ge 1 ] || die "pull needs <session-id>"; validate_sid "$1"; cmd_pull "$1" ;;
     project)     [ $# -ge 1 ] || die "project needs <session-id>";     validate_sid "$1"; cmd_project "$1" "${2:-local}" ;;
-    repo-status) [ $# -ge 1 ] || die "repo-status needs <session-id>"; validate_sid "$1"; cmd_repo_status "$1" ;;
+    repo-status)
+      [ $# -ge 1 ] || die "repo-status needs <session-id>"
+      validate_sid "$1"
+      case "${2:-local}" in
+        local)  cmd_repo_status "$1" ;;
+        remote) cmd_repo_status_remote "$1" ;;
+        *) die "repo-status: unknown mode '${2}' (use 'local' or 'remote')" ;;
+      esac
+      ;;
     repo-pull)   [ $# -ge 1 ] || die "repo-pull needs <session-id>";   validate_sid "$1"; cmd_repo_pull "$1" ;;
     sync-extras) [ $# -ge 1 ] || die "sync-extras needs <session-id>"; validate_sid "$1"; cmd_sync_extras "$1" "${2:-to-remote}" ;;
     sync-all) cmd_sync_all "${1:-both}" ;;

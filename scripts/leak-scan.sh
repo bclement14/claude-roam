@@ -32,10 +32,11 @@ if [ -f "$LOCAL_FILE" ]; then
 fi
 
 # Hits that are known-safe documentation examples are filtered out AFTER a
-# successful match (not excluded from PATTERNS), so a real leak sharing a
-# line with an example is still caught. Covers: RFC5737 example ranges,
-# example.com/org, the documented example user/host, GitHub's noreply email
-# domain, and the doc's own prefix-collision example (alice2).
+# successful match, at MATCH granularity (not line granularity, and not
+# excluded from PATTERNS) -- so a real leak sharing a source line with an
+# example is still caught. Covers: RFC5737 example ranges, example.com/org,
+# the documented example user/host, GitHub's noreply email domain, and the
+# doc's own prefix-collision example (alice2).
 ALLOW='203\.0\.113\.|192\.0\.2\.|198\.51\.100\.|example\.(com|org)|alice@|@myserver|users\.noreply\.github\.com|Users[/-]alice2'
 
 # Exclude this file and the local pattern file: this file necessarily spells
@@ -45,10 +46,17 @@ ALLOW='203\.0\.113\.|192\.0\.2\.|198\.51\.100\.|example\.(com|org)|alice@|@myser
 # CONTENT gets weaker as a result: the regexes above are untouched.
 # -P (PCRE): \b is silently dead under git grep -E on Apple Git; lookaheads
 # also require -P.
+# -o: print only the matched TOKEN per occurrence (as "path:line:token"),
+# not the whole source line. Filtering the whole line through `grep -vE
+# "$ALLOW"` (the old approach) would drop an entire hit line — and any real
+# leak on it — the moment ANY allowed token appeared anywhere on that line.
+# With -o, two matches on the same line become two separate output lines,
+# so the allowlist can remove the example token's own line while leaving a
+# real leak's line intact.
 # git grep exit codes: 0 = match (leak!), 1 = no match (clean), >1 = error
 # (e.g. PCRE not compiled in) — an error must NOT read as clean.
 set +e
-hits="$(git grep -nPI "$PATTERNS" -- . ':(exclude)scripts/leak-scan.sh' ':(exclude)scripts/leak-scan.local' 2>&1)"
+hits="$(git grep -nPIo "$PATTERNS" -- . ':(exclude)scripts/leak-scan.sh' ':(exclude)scripts/leak-scan.local' 2>&1)"
 rc=$?
 set -e
 

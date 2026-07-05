@@ -415,4 +415,92 @@ rc=0; (cmd_pull gg) >/dev/null 2>&1 || rc=$?
 assert_rc "pull refuses remote-unknown" 1 "$rc"
 unset -f compare_mtimes rsync remote_sh find_remote_session find_local_session require_remote
 
+# ---- second hardening wave: H1, H3, H7, M2 ----
+# Prior block unset -f'd the real find_local_session/compare_mtimes/
+# remote_sh/rsync/require_remote it had restored -- re-source to bring back
+# the genuine cmd_push/cmd_pull/_sync_from/sid_to_ere before exercising them.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+
+# H1 + H3: a real cmd_push must propagate a failing rsync as a nonzero
+# return -- NOT let the later unconditional `log "pushed $sid"` (or
+# equivalent) make the function return 0. Before the fix, cmd_push being
+# invoked as `... || return $?` (as cmd_handoff does) disabled errexit for
+# the whole function body, so a stubbed rsync failure (23, matching the
+# review's reproduction) was silently followed by a "success" return.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+compare_mtimes() { printf 'local-newer'; }
+remote_sh() { :; }
+RSYNC_FAIL_LOG="$TMP/rsync_fail_calls"; : > "$RSYNC_FAIL_LOG"
+rsync() { printf '%s\n' "$*" >> "$RSYNC_FAIL_LOG"; return 23; }
+rc=0; out="$( (FORCE=1 cmd_push bbb) 2>&1 )" || rc=$?
+assert_rc "H1: cmd_push propagates a failing rsync (not swallowed)" 23 "$rc"
+case "$out" in
+  *"pushed bbb"*) t_fail "H1: cmd_push must not report success after rsync failure" "output: $out" ;;
+  *)              t_ok   "H1: cmd_push does not report success after rsync failure" ;;
+esac
+
+# H3: the session-file transfer must use -I (--ignore-times) so rsync's own
+# size+mtime quick-check can't silently skip an already-adjudicated,
+# equal-metadata/different-content transfer.
+assert_match "H3: session rsync invocation includes -I" "-aI" "$(cat "$RSYNC_FAIL_LOG")"
+unset -f rsync
+
+# H1: a failing remote_sh (the remote `mkdir -p`) inside cmd_push must also
+# propagate as nonzero, and rsync must never be reached once it has failed.
+RSYNC_UNREACHED_LOG="$TMP/rsync_unreached"; : > "$RSYNC_UNREACHED_LOG"
+rsync() { printf '%s\n' "$*" >> "$RSYNC_UNREACHED_LOG"; }
+remote_sh() { return 5; }
+rc=0; (FORCE=1 cmd_push bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "H1: cmd_push propagates a failing remote_sh mkdir" 5 "$rc"
+assert_eq "H1: rsync must not run after remote_sh mkdir failure" "" "$(cat "$RSYNC_UNREACHED_LOG")"
+unset -f rsync remote_sh compare_mtimes find_local_session require_remote
+
+# H3 (pull side): same -I check for cmd_pull's session-file transfer.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-p1/bbb.jsonl"; }
+compare_mtimes() { printf 'remote-newer'; }
+remote_sh() { :; }
+RSYNC_PULL_LOG="$TMP/rsync_pull_calls"; : > "$RSYNC_PULL_LOG"
+rsync() { printf '%s\n' "$*" >> "$RSYNC_PULL_LOG"; }
+rc=0; (FORCE=1 cmd_pull bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "H3: forced cmd_pull with cooperative stubs succeeds" 0 "$rc"
+assert_match "H3: session pull rsync invocation includes -I" "-aI" "$(cat "$RSYNC_PULL_LOG")"
+unset -f rsync remote_sh compare_mtimes find_remote_session require_remote
+
+# H7: dots in a session id are ERE wildcards for `pgrep -f`, and the id is
+# attacker/collision-adjacent (any two sessions differing only by a dot vs.
+# another char would otherwise cross-match). sid_to_ere must turn '.' into a
+# literal-dot bracket expression before it reaches the pgrep pattern that
+# find_remote_pane/stop_remote_claude build.
+sid="abc.def"
+sid_re="$(sid_to_ere "$sid")"
+pgrep_pattern="claude --resume[= ]${sid_re}( |\$)"
+if printf 'claude --resume abc.def ' | grep -E "$pgrep_pattern" >/dev/null; then
+  t_ok "H7: escaped sid pattern still matches the literal dotted sid"
+else
+  t_fail "H7: escaped sid pattern still matches the literal dotted sid" "no match"
+fi
+if printf 'claude --resume abcXdef ' | grep -E "$pgrep_pattern" >/dev/null; then
+  t_fail "H7: escaped sid pattern must not match a wildcard-substituted sid" "matched abcXdef"
+else
+  t_ok "H7: escaped sid pattern does not match a wildcard-substituted sid"
+fi
+
+# M2: _sync_from must distinguish "ssh/transport failed" (remote_sh itself
+# returns nonzero, e.g. ssh exit 255) from "directory genuinely absent"
+# (remote_sh succeeds and reports NO) -- the old `remote_sh '[ -d "$1" ]'
+# ... || return 0` collapsed both into a silent, successful no-op.
+remote_sh() { return 255; }
+rc=0; (_sync_from /home/alice/.claude/projects/-home-alice-code-p1/plans "$TMP/m2_transport_fail") >/dev/null 2>&1 || rc=$?
+assert_rc "M2: _sync_from propagates an ssh/transport failure" 255 "$rc"
+unset -f remote_sh
+
+remote_sh() { printf 'NO'; }
+rc=0; (_sync_from /home/alice/.claude/projects/-home-alice-code-p1/plans "$TMP/m2_missing_dir") >/dev/null 2>&1 || rc=$?
+assert_rc "M2: _sync_from returns 0 when the remote dir is genuinely absent" 0 "$rc"
+unset -f remote_sh
+
 t_summary
