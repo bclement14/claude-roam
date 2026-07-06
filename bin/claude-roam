@@ -1013,7 +1013,14 @@ union_session_dirs() {
     if [ -d "$d" ]; then names="$names$(basename "$d")
 "; fi
   done
-  rnames="$(remote_sh 'find "$1" -maxdepth 1 -mindepth 1 -type d -name "$2*" 2>/dev/null | while read -r d; do basename "$d"; done' \
+  # Capture find's output BEFORE the basename loop: in `find | while`, the
+  # pipeline's exit status is the while-loop's (always 0 at EOF) and find's
+  # stderr is suppressed, so a genuinely failing find (missing dir,
+  # permission, I/O error) would be silently swallowed and the union would
+  # degrade to local-only while still reporting success. Bare `exit`
+  # propagates find's nonzero status through remote_sh to the || below.
+  rnames="$(remote_sh 'out="$(find "$1" -maxdepth 1 -mindepth 1 -type d -name "$2*" 2>/dev/null)" || exit
+    printf "%s\n" "$out" | while read -r d; do [ -n "$d" ] || continue; basename "$d"; done' \
     "$RPROJECTS" "$(remote_home_encoded)")" || rc=1
   while IFS= read -r rn; do
     [ -n "$rn" ] || continue

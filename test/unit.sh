@@ -234,6 +234,47 @@ assert_rc "union_projects: trailing no-.claude dir keeps rc=0" 0 "$rc"
 assert_match "union_projects: still lists the remote project" "code/aproj" "$out"
 unset -f remote_sh
 
+# union_session_dirs: a FAILING remote find must surface as rc=1 -- in
+# `find | while`, the pipeline's exit status is the while-loop's (always 0
+# at EOF) and find's stderr is suppressed, so a genuine find failure
+# (missing dir, permission, I/O error) would otherwise be silently
+# swallowed and the union would degrade to local-only while still
+# reporting success. Execute the REAL remote script through bash with a
+# fake `find` on a restricted PATH, exactly as remote_sh does.
+USDBIN="$TMP/usdbin"; mkdir -p "$USDBIN"
+for t in bash basename; do ln -sf "$(command -v "$t")" "$USDBIN/$t"; done
+cat > "$USDBIN/find" <<'FEOF'
+#!/bin/bash
+[ "${FAKE_FIND_RC:-0}" != 0 ] && exit "$FAKE_FIND_RC"
+[ -n "${FAKE_FIND_OUT:-}" ] && printf '%s\n' "$FAKE_FIND_OUT"
+exit 0
+FEOF
+chmod +x "$USDBIN/find"
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$USDBIN" bash -s -- "$@"; }
+
+# find fails (rc 42) -> union_session_dirs returns 1, not a silently
+# "successful" local-only union.
+export FAKE_FIND_RC=42 FAKE_FIND_OUT=""
+rc=0; out="$(union_session_dirs)" || rc=$?
+assert_rc "union_session_dirs: remote find failure -> rc=1" 1 "$rc"
+
+# find succeeds with results -> rc=0 and remote-only dirs are translated in.
+export FAKE_FIND_RC=0
+FAKE_FIND_OUT="/home/alice/.claude/projects/-home-alice-code-p1
+/home/alice/.claude/projects/-home-alice-code-usd-remoteonly"
+export FAKE_FIND_OUT
+rc=0; out="$(union_session_dirs)" || rc=$?
+assert_rc "union_session_dirs: find ok -> rc=0" 0 "$rc"
+assert_match "union_session_dirs: remote-only dir translated in" "$(encode_path "$HOME")-code-usd-remoteonly" "$out"
+assert_match "union_session_dirs: local dir still present" "$(encode_path "$HOME")-code-p1" "$out"
+
+# find succeeds with ZERO results -> still rc=0 (empty remote is normal).
+export FAKE_FIND_OUT=""
+rc=0; out="$(union_session_dirs)" || rc=$?
+assert_rc "union_session_dirs: find ok, zero results -> rc=0" 0 "$rc"
+unset FAKE_FIND_RC FAKE_FIND_OUT
+unset -f remote_sh
+
 # ---- Task 2: skeleton ----
 assert_eq "encode_path root-strip" "-Users-alice" "$(encode_path /Users/alice)"
 assert_eq "encode_path nested" "-home-alice-code-proj" "$(encode_path /home/alice/code/proj)"
