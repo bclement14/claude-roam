@@ -147,17 +147,20 @@ RHOME_PHYS_FALLBACK=0; LHOME_PHYS_FALLBACK=0
 local_home_phys()  { printf '%s' "${LHOME_PHYS:-$HOME}"; }
 remote_home_phys() { printf '%s' "${RHOME_PHYS:-$RHOME}"; }
 
-# Remote probe payload: line 1 = logical $HOME, line 2 = physical home (or
-# empty when cd/pwd -P fails). The probe is explicitly NONFATAL — the
+# Remote probe payload: emits TAGGED records — 'ROAM_H=<logical $HOME>' and
+# 'ROAM_P=<physical home>' (value empty when cd/pwd -P fails) — so the local
+# parser can pick them out of a reply that also carries login banners, motd,
+# or rc-file echo noise; positional line parsing would let a banner line be
+# accepted as the remote home. The probe is explicitly NONFATAL — the
 # payload always exits 0 — so only an ssh transport failure is fatal to
 # require_remote; a failed probe just falls back to the logical home.
 remote_home_probe_script() {
 cat <<'SH'
-printf '%s\n' "$HOME"
+printf 'ROAM_H=%s\n' "$HOME"
 if phys=$(cd "$HOME" 2>/dev/null && pwd -P 2>/dev/null); then
-  printf '%s\n' "$phys"
+  printf 'ROAM_P=%s\n' "$phys"
 else
-  printf '\n'
+  printf 'ROAM_P=\n'
 fi
 exit 0
 SH
@@ -203,16 +206,41 @@ require_remote() {
     die "no remote configured: pass --remote <host>, set CLAUDE_ROAM_REMOTE, or edit ${XDG_CONFIG_HOME:-$HOME/.config}/claude-roam/config"
   fi
   validate_remote_alias "$REMOTE"
-  local reply phys
+  local reply line h="" p="" h_n=0 p_n=0 clean
   reply="$(ssh "$REMOTE" "$(remote_home_probe_script)")" || die "ssh to $REMOTE failed"
-  RHOME="$(printf '%s\n' "$reply" | sed -n 1p)"
-  if [ -z "$RHOME" ]; then die "remote \$HOME is empty"; fi
-  phys="$(printf '%s\n' "$reply" | sed -n 2p)"
+  # Tagged-record parsing (banner-proof): startup noise (motd, rc-file echo)
+  # may precede or follow the probe's records, so lines are matched by TAG,
+  # never by position, and untagged lines are ignored. Exactly-one-record
+  # semantics per tag: a missing or duplicated ROAM_H means the reply as a
+  # whole cannot be trusted (die); a missing/duplicated ROAM_P degrades only
+  # the physical probe (fall back to the logical home + doctor flag).
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ROAM_H=*) h="${line#ROAM_H=}"; h_n=$((h_n+1)) ;;
+      ROAM_P=*) p="${line#ROAM_P=}"; p_n=$((p_n+1)) ;;
+    esac
+  done <<EOF
+$reply
+EOF
+  if [ "$h_n" -ne 1 ]; then
+    die "malformed home probe reply from $REMOTE (expected exactly one ROAM_H record, got $h_n) — cannot trust the transport; check the remote shell's startup output"
+  fi
+  if [ -z "$h" ]; then die "remote \$HOME is empty"; fi
+  # The logical home is used to build every remote path: it must be an
+  # absolute, lexically-normal, non-root path or nothing can be trusted.
+  if ! clean="$(_clean_abs_cwd "$h")" || [ -z "$clean" ] || [ "$clean" = "/" ]; then
+    die "remote \$HOME '$h' is not a usable absolute path; refusing"
+  fi
+  RHOME="$clean"
   RHOME_PHYS_FALLBACK=0
-  # An empty/relative/lexically-abnormal/root ('/') physical line is treated
-  # as a failed probe: fall back to the logical home and flag it for doctor.
-  if phys="$(_clean_abs_cwd "$phys")" && [ -n "$phys" ] && [ "$phys" != "/" ]; then
-    RHOME_PHYS="$phys"
+  # An absent/duplicated ROAM_P record, or an empty/relative/lexically-
+  # abnormal/root ('/') value, is treated as a failed probe: fall back to
+  # the logical home and flag it for doctor.
+  if [ "$p_n" -ne 1 ]; then
+    RHOME_PHYS="$RHOME"
+    RHOME_PHYS_FALLBACK=1
+  elif clean="$(_clean_abs_cwd "$p")" && [ -n "$clean" ] && [ "$clean" != "/" ]; then
+    RHOME_PHYS="$clean"
   else
     RHOME_PHYS="$RHOME"
     RHOME_PHYS_FALLBACK=1
@@ -368,10 +396,20 @@ $matches"
   printf '%s' "$matches"
 }
 
+# Every remote path holding ${sid}.jsonl anywhere under RPROJECTS (all
+# project dirs, both accepted encodings). Prints newline-separated matches
+# (possibly none: a missing projects dir is genuinely "no matches"). A
+# NONZERO return means the ssh/find itself failed — callers MUST treat that
+# as UNKNOWN state, never as "no matches".
+_remote_sid_matches() {
+  remote_sh '[ -d "$1" ] || exit 0
+out="$(find "$1" -maxdepth 2 -name "$2.jsonl" 2>/dev/null)" || exit 1
+printf "%s\n" "$out"' "$RPROJECTS" "$1"
+}
+
 find_remote_session() {
   local sid="$1" matches count
-  matches="$(remote_sh 'find "$1" -maxdepth 2 -name "$2.jsonl" 2>/dev/null' \
-    "$RPROJECTS" "$sid" || true)"
+  matches="$(_remote_sid_matches "$sid" || true)"
   if [ -z "$matches" ]; then
     die "session $sid not found on remote $REMOTE under $RPROJECTS"
   fi
@@ -392,13 +430,17 @@ $matches"
 
 # Blocker-1.2 corroboration: encoded dir names are lossy ('/' and literal
 # '-' both encode to '-'), so /home/alice/project and the outside-home
-# sibling /home/alice-project share one encoding. Before a sid-specific
-# transfer trusts an encoded parent that matched a NON-canonical accepted
-# root, the transcript's own FIRST usable raw cwd must corroborate it: the
-# cwd must sit at a raw '/' boundary under an accepted raw home root (either
-# side, either spelling — a transferred transcript legitimately carries the
-# other machine's paths) AND its root-relative suffix must encode to exactly
-# the tail the parent claims. Dies on any disagreement.
+# sibling /home/alice-project share one encoding. On a DUAL-ROOT side the
+# canonical (physical) encoding is just as lossy as the logical one — e.g.
+# -lustre-home-alice-project can be $RHOME_PHYS/project OR the sibling
+# /lustre/home/alice-project — so before a sid-specific transfer trusts ANY
+# home-encoded parent there, the transcript's own FIRST usable raw cwd must
+# corroborate it: the cwd must sit at a raw '/' boundary under an accepted
+# raw home root (either side, either spelling — a transferred transcript
+# legitimately carries the other machine's paths) AND its root-relative
+# suffix must encode to exactly the tail the parent claims. Dies on any
+# disagreement, including a transcript with no usable cwd at all (encoded
+# identity alone cannot distinguish the lossy sibling).
 # $1 = encoded tail ('' or '-...'), $2 = newline-delimited raw cwd
 # candidates (transcript order), $3 = context label for error messages.
 _corroborate_parent_tail() {
@@ -413,7 +455,7 @@ _corroborate_parent_tail() {
 $cands
 EOF
   if [ -z "$first" ]; then
-    die "$label: the transcript has no usable cwd record to corroborate a non-canonical home encoding; refusing to translate"
+    die "$label: the transcript has no usable cwd record to corroborate its home-encoded project dir (dual-root side); refusing to translate"
   fi
   for root in "$HOME" "$(local_home_phys)" "$RHOME" "$(remote_home_phys)"; do
     [ -n "$root" ] || continue
@@ -425,42 +467,50 @@ EOF
   die "$label: the transcript's cwd '$first' does not corroborate the encoded project dir (lossy '-' encoding — e.g. /home/alice/project vs the sibling /home/alice-project); refusing to translate. Inspect the directory and migrate it manually if it is legitimate"
 }
 
-# Sid ops, LOCAL side: when the local side is dual-root and the session's
-# parent dir matched the NON-canonical (logical) root, corroborate via the
-# local transcript before any translation/transfer. Canonical or single-root
-# matches keep today's path untouched.
+# Sid ops, LOCAL side: when the local side is dual-root, EVERY session
+# parent dir under an accepted home encoding — canonical (physical) AND
+# non-canonical (logical) — must be corroborated by the local transcript
+# before any translation/transfer: both encodings are equally lossy, so a
+# canonical physical sibling (e.g. /lustre/home/alice-project) would
+# otherwise be trusted and mapped to the wrong project. Single-root sides
+# skip corroboration entirely (today's behavior, byte-identical). Parents
+# outside both encodings return 0 here; translate_dir refuses them itself.
 _require_trusted_local_parent() {
-  local sid="$1" name="$2" lfile="$3" lphys lenc cands
+  local sid="$1" name="$2" lfile="$3" lphys lenc leph tail cands
   lphys="$(local_home_phys)"
   if [ "$lphys" = "$HOME" ]; then return 0; fi
+  leph="$(encode_path "$lphys")"
   lenc="$(encode_path "$HOME")"
   case "$name" in
-    "$lenc"|"$lenc"-*) : ;;
+    "$leph"|"$leph"-*) tail="${name#"$leph"}" ;;
+    "$lenc"|"$lenc"-*) tail="${name#"$lenc"}" ;;
     *) return 0 ;;
   esac
   cands="$(_extract_cwd_candidates "$lfile")" || return $?
-  _corroborate_parent_tail "${name#"$lenc"}" "$cands" "session $sid (local project '$name')"
+  _corroborate_parent_tail "$tail" "$cands" "session $sid (local project '$name')"
 }
 
-# Sid ops, REMOTE side: same rule for a remote parent dir that matched the
-# NON-canonical (logical) remote root; the corroborating cwd records are
-# read from the remote transcript (one extra round trip, dual-root only).
+# Sid ops, REMOTE side: same rule for a remote parent dir under EITHER
+# accepted remote encoding; the corroborating cwd records are read from the
+# remote transcript (one extra round trip, dual-root only).
 _require_trusted_remote_parent() {
-  local sid="$1" name="$2" rfile="$3" rphys renc cands rc=0
+  local sid="$1" name="$2" rfile="$3" rphys renc reph tail cands rc=0
   rphys="$(remote_home_phys)"
   if [ "$rphys" = "$RHOME" ]; then return 0; fi
+  reph="$(encode_path "$rphys")"
   renc="$(encode_path "$RHOME")"
   case "$name" in
-    "$renc"|"$renc"-*) : ;;
+    "$reph"|"$reph"-*) tail="${name#"$reph"}" ;;
+    "$renc"|"$renc"-*) tail="${name#"$renc"}" ;;
     *) return 0 ;;
   esac
   cands="$(remote_sh "$(cwd_extract_script)" "$rfile")" || rc=$?
   if [ "$rc" -eq 3 ]; then
-    die "validating session $sid's non-canonical project dir requires jq or python3 on the remote; install one there"
+    die "validating session $sid's home-encoded project dir requires jq or python3 on the remote; install one there"
   elif [ "$rc" -ne 0 ]; then
-    die "could not read cwd records from $REMOTE:$rfile (ssh failed) — cannot corroborate its non-canonical home encoding; refusing"
+    die "could not read cwd records from $REMOTE:$rfile (ssh failed) — cannot corroborate its home-encoded project dir; refusing"
   fi
-  _corroborate_parent_tail "${name#"$renc"}" "$cands" "session $sid (remote project '$name')"
+  _corroborate_parent_tail "$tail" "$cands" "session $sid (remote project '$name')"
 }
 
 # Blocker-3 duplicate guard for push/handoff: with two accepted remote
@@ -490,6 +540,37 @@ _refuse_remote_twin() {
   target: $RPROJECTS/$rname/${sid}.jsonl
   twin:   $twin_file
 refusing (--force does not override this): merge them manually — keep the newest file, delete the stale twin — then re-run"
+  fi
+}
+
+# Global-sid preflight for push/handoff (Blocker 3, widened): the same-tail
+# twin stat above cannot see the sid sitting under a DIFFERENT project tail
+# (or any unexpected dir), yet pushing then would create a globally
+# ambiguous sid that every later lookup refuses. So before push mutates
+# anything (and again as cmd_push's post-stop recheck), scan the whole
+# remote projects tree for ${sid}.jsonl and permit exactly two outcomes: no
+# match at all, or one match at the intended target path. Anything else
+# refuses with the paths; --force never overrides an identity ambiguity;
+# a failed scan (ssh/find) refuses too — unknown state is never "no match".
+# Costs one ssh round trip; single- and dual-root sides both need it.
+# $1 = sid, $2 = the intended remote target file (absolute).
+_refuse_remote_sid_elsewhere() {
+  local sid="$1" target="$2" matches rc=0 m extra=""
+  matches="$(_remote_sid_matches "$sid")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "could not scan $REMOTE:$RPROJECTS for existing copies of $sid (ssh/find failed); refusing — never transfer when the duplicate state is unknown"
+  fi
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    if [ "$m" != "$target" ]; then extra="$extra  $m
+"; fi
+  done <<EOF
+$matches
+EOF
+  if [ -n "$extra" ]; then
+    die "session $sid already exists elsewhere on $REMOTE:
+$extra  intended target: $target
+refusing (--force does not override this): transferring would create a globally ambiguous sid; merge or remove the other copies manually, then re-run"
   fi
 }
 
@@ -651,9 +732,12 @@ cmd_push() {
   remote_dir="$RPROJECTS/$remote_name"
   remote_file="$remote_dir/${sid}.jsonl"
   validate_path "$remote_file"
-  # Duplicate-encoding guard: runs BEFORE any backup/mkdir/rsync, and also
-  # re-runs here when handoff invokes us after its stop (post-stop recheck).
+  # Duplicate guards: run BEFORE any backup/mkdir/rsync, and also re-run
+  # here when handoff invokes us after its stop (post-stop recheck). The
+  # twin stat covers the same-tail other-encoding pair; the global scan
+  # covers the same sid under ANY other remote project dir.
   _refuse_remote_twin "$sid" "$remote_name"
+  _refuse_remote_sid_elsewhere "$sid" "$remote_file"
 
   # git moves the session's CODE separately from this JSONL transfer -- warn
   # (or, with --require-clean, refuse) if the project repo isn't fully
@@ -860,44 +944,49 @@ _clean_abs_cwd() {
 # Resolve one cleaned candidate ($1) to a LOCAL cwd, given the session file's
 # encoded parent dir name ($2) and the encoded local $HOME ($3). Prints the
 # local path and returns 0 on a match, else returns 1.
-#   Direct match:  the candidate already encodes to the parent (local-origin,
-#                  or a session whose project sits outside $HOME).
-#   Foreign match: ONLY when the parent is the encoded local $HOME or a child
-#                  of it. Encoding is length-preserving, so the last k chars
-#                  of the candidate (k = length of the parent's tail past the
-#                  home prefix) are the relative suffix; its slashes must
-#                  encode back to that tail. k=0 (parent IS $HOME) maps any
-#                  candidate to $HOME. NOTE: because '/' and '-' collide under
-#                  encoding, this trusts the candidate's own slash placement;
-#                  it authenticates a legitimate remote-origin path but cannot
-#                  detect a maliciously slash-shifted single record.
+#   Direct match:  the candidate's OWN encoding equals the parent exactly
+#                  (local-origin, or a session whose project sits outside
+#                  $HOME) — the ONLY way an outside-home candidate resolves.
+#   Root-relative: the candidate sits at a raw '/' boundary under an ACCEPTED
+#                  raw home root ($HOME, LHOME_PHYS, $RHOME, RHOME_PHYS);
+#                  strip that root, map the relative suffix onto the local
+#                  logical $HOME, and accept ONLY when the suffix's encoding
+#                  equals the parent's tail past its own accepted local home
+#                  encoding (same parity rule as _corroborate_parent_tail).
+#                  A foreign root (/evil/...) can therefore never resolve by
+#                  suffix resemblance: the candidate must first authenticate
+#                  against a root we actually accept. NOTE: because '/' and
+#                  '-' collide under encoding, this still trusts the
+#                  candidate's own slash placement WITHIN the relative
+#                  suffix; it authenticates a legitimate remote-origin path
+#                  but cannot detect a maliciously slash-shifted record
+#                  under a genuine accepted root.
 _resolve_cwd_candidate() {
-  local c="$1" parent="$2" lhp="$3" tail k clen suffix enc
-  enc="$(encode_path "$c")"
-  if [ "$enc" = "$parent" ]; then
+  local c="$1" parent="$2" lhp="$3" leph ptail have_tail=0 root rel
+  if [ "$(encode_path "$c")" = "$parent" ]; then
     printf '%s' "$c"
     return 0
   fi
-  if [ "$parent" = "$lhp" ] || [[ "$parent" == "$lhp"-* ]]; then
-    tail="${parent#"$lhp"}"
-    k="${#tail}"
-    clen="${#c}"
-    if [ "$k" -eq 0 ]; then
-      printf '%s' "$HOME"
-      return 0
-    fi
-    if [ "$clen" -ge "$k" ]; then
-      suffix="${c:$((clen - k))}"
-      case "$suffix" in
-        /*)
-          if [ "$(printf '%s' "$suffix" | tr '/' '-')" = "$tail" ]; then
-            printf '%s%s' "$HOME" "$suffix"
-            return 0
-          fi
-          ;;
-      esac
-    fi
+  # Root-relative mapping applies only when the PARENT itself sits under an
+  # accepted local home encoding (canonical/physical first, then logical);
+  # outside-home parents accept direct matches only (no suffix inference).
+  leph="$(local_home_encoded)"
+  if [ "$parent" = "$leph" ] || [[ "$parent" == "$leph"-* ]]; then
+    ptail="${parent#"$leph"}"; have_tail=1
+  elif [ "$parent" = "$lhp" ] || [[ "$parent" == "$lhp"-* ]]; then
+    ptail="${parent#"$lhp"}"; have_tail=1
   fi
+  if [ "$have_tail" -ne 1 ]; then return 1; fi
+  for root in "$HOME" "$(local_home_phys)" "$RHOME" "$(remote_home_phys)"; do
+    [ -n "$root" ] || continue
+    if [ "$c" = "$root" ] || [[ "$c" == "$root"/* ]]; then
+      rel="${c#"$root"}"
+      if [ "$(printf '%s' "$rel" | tr '/' '-')" = "$ptail" ]; then
+        printf '%s%s' "$HOME" "$rel"
+        return 0
+      fi
+    fi
+  done
   return 1
 }
 
@@ -1288,12 +1377,32 @@ sync_try() {
 # swallowed discovery failure would silently degrade to a local-only sweep
 # (empty union) while still reporting overall success.
 union_session_dirs() {
-  local d names rnames rn ln rc=0
+  local d names rnames rn ln rc=0 lphys lelg leph bn
   names=""
   for d in "$PROJECTS/$(local_home_encoded)"*; do
     if [ -d "$d" ]; then names="$names$(basename "$d")
 "; fi
   done
+  # Dual LOCAL encodings: also scan the non-canonical (logical) local prefix
+  # and collapse boundary-matching names onto the canonical key, so historic
+  # logical-encoding local dirs are neither silently omitted nor listed as a
+  # second entry for the same project. Single-root locals skip this block
+  # entirely (byte-identical to the single scan above).
+  lphys="$(local_home_phys)"
+  if [ "$lphys" != "$HOME" ]; then
+    lelg="$(encode_path "$HOME")"
+    leph="$(local_home_encoded)"
+    for d in "$PROJECTS/$lelg"*; do
+      [ -d "$d" ] || continue
+      bn="$(basename "$d")"
+      case "$bn" in
+        "$lelg"|"$lelg"-*) names="$names$leph${bn#"$lelg"}
+" ;;
+        *) names="$names$bn
+" ;;
+      esac
+    done
+  fi
   # Capture find's output BEFORE the basename loop: in `find | while`, the
   # pipeline's exit status is the while-loop's (always 0 at EOF) and find's
   # stderr is suppressed, so a genuinely failing find (missing dir,
@@ -1350,10 +1459,11 @@ EOF
 }
 
 cmd_sync_all() {
-  local direction="${1:-both}" name rname rsrc ldir rdir rel sub
+  local direction="${1:-both}" name rname rsrc lsrc ldir rdir rel sub
   local sdirs sdirs_rc=0 prels prels_rc=0
   local unclean_rels="" unclean_n
   local rphys eph elg dual=0 rdirlist="" rdirlist_rc=0 rtail rtwin has_canon has_twin
+  local lphys leph="" lelg="" ldual=0 ltwin skip_sessions=0
   case "$direction" in both|to-remote|from-remote) ;; *) die "sync-all: direction must be both|to-remote|from-remote" ;; esac
   require_remote
   FAILED_N=0
@@ -1383,19 +1493,59 @@ cmd_sync_all() {
     printf "%s\n" "$out" | while read -r d; do [ -n "$d" ] || continue; basename "$d"; done' \
       "$RPROJECTS" "$eph" "$elg")" || rdirlist_rc=$?
     if [ "$rdirlist_rc" -ne 0 ]; then
-      # Fail closed on adjudication, not on the whole sweep: count the
-      # failure, fall back to canonical-only paths (a non-canonical-only
-      # project will then fail its own rsync step loudly, never read a
-      # wrong source silently).
+      # Fail closed on the ENTIRE session-dir section: with the twin state
+      # unknown, any canonical mkdir/rsync here could create a twin of (or
+      # clobber) data that actually lives under the other encoding. Count
+      # the failure and let only the UNRELATED sections (project extras,
+      # home extras) continue — zero session-dir mutation on either side.
       FAILED_N=$((FAILED_N+1))
-      log "  WARN: remote twin discovery failed — proceeding with canonical paths only"
-      dual=0
+      log "  WARN: remote twin discovery failed — twin state UNKNOWN; skipping ALL session-directory transfers (nothing was written)"
+      skip_sessions=1
     fi
   fi
-  while IFS= read -r name; do
+  # Dual LOCAL encodings (mirrors the remote block): needed to adjudicate,
+  # per union entry, whether the local data lives under the canonical or the
+  # historic logical encoding. Purely local (no round trips, no failure
+  # mode); single-root locals skip it.
+  lphys="$(local_home_phys)"
+  if [ "$lphys" != "$HOME" ]; then
+    ldual=1
+    leph="$(encode_path "$lphys")"
+    lelg="$(encode_path "$HOME")"
+  fi
+  [ "$skip_sessions" -eq 1 ] || while IFS= read -r name; do
     [ -n "$name" ] || continue
     rname="$(translate_dir "$name" to-remote 2>/dev/null)" || continue
     rsrc="$rname"
+    lsrc="$name"
+    if [ "$ldual" -eq 1 ]; then
+      case "$name" in
+        "$leph"|"$leph"-*)
+          ltwin="$lelg${name#"$leph"}"
+          if [ -d "$PROJECTS/$name" ] && [ -d "$PROJECTS/$ltwin" ]; then
+            # Both LOCAL encodings hold data: same fail-closed policy as the
+            # remote group below — failed step + migration hint, no pick.
+            FAILED_N=$((FAILED_N+1))
+            log "  WARN: $name exists locally under BOTH home encodings ($name and $ltwin) — skipped; merge them manually, then re-run"
+            continue
+          fi
+          if [ -d "$PROJECTS/$ltwin" ]; then
+            if [ "$direction" = "to-remote" ]; then
+              # Local data lives only under the non-canonical encoding:
+              # READ the actual dir; never create the local canonical twin.
+              lsrc="$ltwin"
+            else
+              # from-remote/both would write a canonical local dir next to
+              # the existing non-canonical one — the twin state this tool
+              # refuses everywhere else. Failed step + migration hint.
+              FAILED_N=$((FAILED_N+1))
+              log "  WARN: $name exists locally only under the non-canonical encoding ($ltwin) — skipped ($direction would create a canonical local twin); migrate it manually (rename $ltwin to $name), then re-run"
+              continue
+            fi
+          fi
+          ;;
+      esac
+    fi
     if [ "$dual" -eq 1 ]; then
       rtail="${rname#"$eph"}"
       rtwin="$elg$rtail"
@@ -1410,12 +1560,25 @@ cmd_sync_all() {
         continue
       fi
       if [ "$has_twin" -eq 1 ]; then
-        # Data lives only under the non-canonical encoding: READ from the
-        # actual dir; writes still go to the canonical destination.
-        rsrc="$rtwin"
+        if [ "$direction" = "from-remote" ]; then
+          # Remote data lives only under the non-canonical encoding: READ
+          # from the actual dir; no remote write happens in this direction,
+          # so the canonical remote twin is never created.
+          rsrc="$rtwin"
+        else
+          # to-remote/both would create the canonical remote dir while the
+          # non-canonical one still holds data — an implicit half-migration
+          # that leaves BOTH encodings populated (the state every other
+          # command refuses). Failed step + migration hint instead.
+          FAILED_N=$((FAILED_N+1))
+          log "  WARN: $name exists on $REMOTE only under the non-canonical encoding ($rtwin) — skipped ($direction would create a canonical twin on $REMOTE); migrate it manually (rename $rtwin to $rname), then re-run"
+          continue
+        fi
       fi
     fi
-    ldir="$PROJECTS/$name"; rdir="$RPROJECTS/$rname"
+    # lsrc == name except in the to-remote non-canonical-local case, where
+    # the EXISTING non-canonical dir is read and no canonical dir is made.
+    ldir="$PROJECTS/$lsrc"; rdir="$RPROJECTS/$rname"
     # validate_path dies on violation — run it in a subshell to skip instead.
     if ! (validate_path "$rdir") 2>/dev/null; then
       FAILED_N=$((FAILED_N+1)); log "  WARN: skipping unsafe path: $rdir"; continue
@@ -1840,10 +2003,12 @@ cmd_handoff() {
   # is still running instead of dying inside cmd_push after it (the recovery
   # trap would restart it, but never stopping is strictly safer).
   _preflight_validate_path "$remote_file"
-  # Duplicate-encoding guard BEFORE the stop; cmd_push repeats it inside the
-  # post-stop transfer, so a twin appearing in between still fails closed
+  # Duplicate guards BEFORE the stop — the same-tail twin stat AND the
+  # global any-project sid scan; cmd_push repeats both inside the post-stop
+  # transfer, so a duplicate appearing in between still fails closed
   # (through the normal recovery path).
   _preflight_guard _refuse_remote_twin "$sid" "$remote_name"
+  _preflight_guard _refuse_remote_sid_elsewhere "$sid" "$remote_file"
   cmp="$(compare_mtimes "$local_file" "$remote_file")"
   if [ "$cmp" = "remote-unknown" ]; then
     die "could not determine remote state (ssh/stat failed); refusing to proceed (remote claude was NOT stopped)"
