@@ -1908,4 +1908,590 @@ assert_eq "stop: every re-sent C-c is back-to-back with its pair" "yes" "$pairs_
 unset FAKE_PGREP_RC FAKE_SEQ_LOG
 unset -f remote_sh; unset REMOTE
 
+# ============================================================================
+# Home-prefix aliases v1: physical-home detection, dual-root accept sets,
+# canonical (physical) emission, fail-closed duplicates and lossy-encoding
+# corroboration. Reduced scope: auto-detected roots only (no config arrays).
+# ============================================================================
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+LHP="$(encode_path "$HOME")"
+
+# ---- HP1: the remote probe payload (Blocker 6 protocol) ----
+HPPROBE_OUT="$TMP/hp_probe_out"
+
+# cd/pwd failure inside the payload must NOT fail the payload (exit 0), and
+# the second line must be empty (the local parser turns that into fallback).
+rc=0; env HOME="$TMP/hp-does-not-exist" bash -c "$(remote_home_probe_script)" > "$HPPROBE_OUT" || rc=$?
+assert_rc "probe: cd failure is nonfatal (payload exits 0)" 0 "$rc"
+assert_eq "probe: line 1 is the logical HOME" "$TMP/hp-does-not-exist" "$(sed -n 1p "$HPPROBE_OUT")"
+assert_eq "probe: line 2 empty when the probe fails" "" "$(sed -n 2p "$HPPROBE_OUT")"
+
+# multi-hop symlink: HOME -> l1 -> real resolves to the final physical dir.
+mkdir -p "$TMP/hp_real"
+ln -s "$TMP/hp_real" "$TMP/hp_l1"
+ln -s "$TMP/hp_l1" "$TMP/hp_l2"
+HP_PHYS_EXPECT="$(cd "$TMP/hp_real" && pwd -P)"
+rc=0; env HOME="$TMP/hp_l2" bash -c "$(remote_home_probe_script)" > "$HPPROBE_OUT" || rc=$?
+assert_rc "probe: symlinked home probe succeeds" 0 "$rc"
+assert_eq "probe: multi-hop symlink resolves to the physical home" "$HP_PHYS_EXPECT" "$(sed -n 2p "$HPPROBE_OUT")"
+
+# ---- HP1b: require_remote parses the two-line reply (ssh stubbed) ----
+FAKE_SSH_RC=0; FAKE_SSH_REPLY=""
+ssh() { printf '%s' "$FAKE_SSH_REPLY"; return "$FAKE_SSH_RC"; }
+hp_rr() {  # reset remote state, then run the REAL require_remote
+  RHOME=""; RHOME_PHYS=""; RHOME_PHYS_FALLBACK=0; REMOTE=""
+  REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=stubhost
+  require_remote
+}
+
+FAKE_SSH_REPLY='/home/alice
+/home/alice'
+rc=0; hp_rr || rc=$?
+assert_rc "require_remote: equal two-line reply accepted" 0 "$rc"
+assert_eq "require_remote: physical == logical" "/home/alice" "$(remote_home_phys)"
+assert_eq "require_remote: equal homes set no fallback flag" 0 "$RHOME_PHYS_FALLBACK"
+
+FAKE_SSH_REPLY='/home/alice
+/lustre/home/alice'
+rc=0; hp_rr || rc=$?
+assert_rc "require_remote: differing physical home accepted" 0 "$rc"
+assert_eq "require_remote: RHOME stays the logical home" "/home/alice" "$RHOME"
+assert_eq "require_remote: physical home detected" "/lustre/home/alice" "$(remote_home_phys)"
+assert_eq "require_remote: canonical encoding is the physical one" "-lustre-home-alice" "$(remote_home_encoded)"
+assert_eq "require_remote: RPROJECTS composed from the LOGICAL home" "/home/alice/.claude/projects" "$RPROJECTS"
+
+FAKE_SSH_REPLY='/home/alice'
+rc=0; hp_rr || rc=$?
+assert_rc "require_remote: missing second line falls back" 0 "$rc"
+assert_eq "require_remote: fallback physical == logical" "/home/alice" "$(remote_home_phys)"
+assert_eq "require_remote: fallback flag set (missing line)" 1 "$RHOME_PHYS_FALLBACK"
+
+FAKE_SSH_REPLY='/home/alice
+'
+rc=0; hp_rr || rc=$?
+assert_eq "require_remote: empty second line falls back" "/home/alice" "$(remote_home_phys)"
+assert_eq "require_remote: fallback flag set (empty line)" 1 "$RHOME_PHYS_FALLBACK"
+
+FAKE_SSH_REPLY='/home/alice
+lustre/home/alice'
+rc=0; hp_rr || rc=$?
+assert_eq "require_remote: relative physical line falls back" "/home/alice" "$(remote_home_phys)"
+assert_eq "require_remote: fallback flag set (invalid line)" 1 "$RHOME_PHYS_FALLBACK"
+
+FAKE_SSH_REPLY='/home/alice
+/'
+rc=0; hp_rr || rc=$?
+assert_eq "require_remote: root '/' physical home is rejected (fallback)" "/home/alice" "$(remote_home_phys)"
+assert_eq "require_remote: fallback flag set (root alias)" 1 "$RHOME_PHYS_FALLBACK"
+
+# ssh transport failure stays FATAL (never a silent fallback).
+FAKE_SSH_RC=255; FAKE_SSH_REPLY=''
+rc=0; out="$( (hp_rr) 2>&1 )" || rc=$?
+assert_rc "require_remote: ssh transport failure is still fatal" 1 "$rc"
+assert_match "require_remote: transport failure names ssh" "ssh to stubhost failed" "$out"
+FAKE_SSH_RC=0
+
+# accept-set construction refuses colliding roots (Blocker 1 rule).
+FAKE_SSH_REPLY='/a/b
+/a-b'
+rc=0; out="$( (hp_rr) 2>&1 )" || rc=$?
+assert_rc "require_remote: equal-encoding roots (/a/b vs /a-b) refuse" 1 "$rc"
+assert_match "collision refusal names the colliding encoding" "colliding encodings" "$out"
+assert_match "collision refusal names both raw roots" "/a-b" "$out"
+
+FAKE_SSH_REPLY='/home/b
+/home/b/x/home'
+rc=0; out="$( (hp_rr) 2>&1 )" || rc=$?
+assert_rc "require_remote: '-'-boundary-overlapping roots refuse (no longest-match)" 1 "$rc"
+assert_match "overlap refusal names the colliding encoding" "colliding encodings" "$out"
+
+# RPROJECTS override + dual roots: override wins, names stay canonical.
+REMOTE_PROJECTS_OVERRIDE="/custom/proj"
+FAKE_SSH_REPLY='/home/alice
+/lustre/home/alice'
+rc=0; hp_rr || rc=$?
+assert_eq "require_remote: RPROJECTS override respected under dual roots" "/custom/proj" "$RPROJECTS"
+assert_eq "translate under RPROJECTS override still emits canonical names" \
+  "-lustre-home-alice-code-app" "$(translate_dir "$LHP-code-app" to-remote)"
+REMOTE_PROJECTS_OVERRIDE=""
+unset -f ssh
+RHOME=""; RHOME_PHYS=""; RHOME_PHYS_FALLBACK=0; REMOTE=""; REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
+
+# ---- HP2: translation accept/emit matrix (dual remote root) ----
+REMOTE=stub; RHOME="/home/alice"; RHOME_PHYS="/lustre/home/alice"; RHOME_PHYS_FALLBACK=0
+assert_eq "translate to-local accepts the logical encoding" "$LHP-code-app" "$(translate_dir "-home-alice-code-app" to-local)"
+assert_eq "translate to-local accepts the physical encoding" "$LHP-code-app" "$(translate_dir "-lustre-home-alice-code-app" to-local)"
+assert_eq "translate to-remote emits the canonical physical encoding" "-lustre-home-alice-code-app" "$(translate_dir "$LHP-code-app" to-remote)"
+assert_eq "translate exact logical root (empty suffix)" "$LHP" "$(translate_dir "-home-alice" to-local)"
+assert_eq "translate exact physical root (empty suffix)" "$LHP" "$(translate_dir "-lustre-home-alice" to-local)"
+assert_eq "translate preserves a home-bearing project suffix intact" \
+  "-lustre-home-alice-code-my-home-app" "$(translate_dir "$LHP-code-my-home-app" to-remote)"
+assert_eq "round trip logical -> local -> remote canonicalizes" \
+  "-lustre-home-alice-code-app" "$(translate_dir "$(translate_dir "-home-alice-code-app" to-local)" to-remote)"
+rc=0; (translate_dir "-home-alice2-code-app" to-local) >/dev/null 2>&1 || rc=$?
+assert_rc "translate rejects '-'-boundary collision on the logical root" 1 "$rc"
+rc=0; (translate_dir "-lustre-home-alice2-code-app" to-local) >/dev/null 2>&1 || rc=$?
+assert_rc "translate rejects '-'-boundary collision on the physical root" 1 "$rc"
+rc=0; (translate_dir "-elsewhere-code-app" to-local) >/dev/null 2>&1 || rc=$?
+assert_rc "translate still rejects a dir outside both roots" 1 "$rc"
+
+# single-root behavior is unchanged (explicit physical == logical, AND the
+# unset-globals test seam).
+RHOME_PHYS="/home/alice"
+assert_eq "single-root translate to-remote unchanged" "-home-alice-code-app" "$(translate_dir "$LHP-code-app" to-remote)"
+RHOME_PHYS=""
+assert_eq "unset RHOME_PHYS behaves as a single root (seam)" "-home-alice-code-app" "$(translate_dir "$LHP-code-app" to-remote)"
+
+# union discovery merges the two remote encodings into ONE canonical entry.
+RHOME_PHYS="/lustre/home/alice"
+remote_sh() { case "$1" in *find*-maxdepth\ 1*) printf '%s\n' "-home-alice-code-ua" "-lustre-home-alice-code-ua" ;; *) : ;; esac; }
+out="$(union_session_dirs)"
+assert_eq "union: both remote encodings collapse to one canonical local entry" \
+  "1" "$(printf '%s\n' "$out" | grep -cxF -e "$LHP-code-ua")"
+unset -f remote_sh
+
+# ---- HP3: lossy-encoding corroboration (Blocker 1.2) ----
+REMOTE=stub; RHOME="/home/alice"; RHOME_PHYS="/lustre/home/alice"; LHOME_PHYS=""
+rc=0; (_corroborate_parent_tail "-project" "/home/alice/project" t) >/dev/null 2>&1 || rc=$?
+assert_rc "corroborate: logical raw cwd agrees with the tail" 0 "$rc"
+rc=0; (_corroborate_parent_tail "-project" "/lustre/home/alice/project" t) >/dev/null 2>&1 || rc=$?
+assert_rc "corroborate: physical raw cwd agrees with the tail" 0 "$rc"
+rc=0; (_corroborate_parent_tail "-code-app" "$HOME/code/app" t) >/dev/null 2>&1 || rc=$?
+assert_rc "corroborate: the LOCAL raw home is accepted too (transferred transcript)" 0 "$rc"
+rc=0; (_corroborate_parent_tail "" "/home/alice" t) >/dev/null 2>&1 || rc=$?
+assert_rc "corroborate: exact root with empty tail agrees" 0 "$rc"
+rc=0; out="$( (_corroborate_parent_tail "-project" "/home/alice-project" t) 2>&1 )" || rc=$?
+assert_rc "corroborate: literal-hyphen sibling (/home/alice-project) refuses" 1 "$rc"
+assert_match "corroborate: sibling refusal explains the lossy encoding" "does not corroborate" "$out"
+rc=0; (_corroborate_parent_tail "-code-app" "/evil/code/app" t) >/dev/null 2>&1 || rc=$?
+assert_rc "corroborate: cwd outside every raw root refuses" 1 "$rc"
+rc=0; (_corroborate_parent_tail "-code-app" "${HOME}zz/code/app" t) >/dev/null 2>&1 || rc=$?
+assert_rc "corroborate: raw-boundary sibling of \$HOME refuses despite matching suffix" 1 "$rc"
+rc=0; out="$( (_corroborate_parent_tail "-code-app" "" t) 2>&1 )" || rc=$?
+assert_rc "corroborate: no usable cwd record refuses" 1 "$rc"
+assert_match "corroborate: no-cwd refusal says so" "no usable cwd" "$out"
+rc=0; (_corroborate_parent_tail "-project" '/home/alice-project
+/home/alice/project' t) >/dev/null 2>&1 || rc=$?
+assert_rc "corroborate: the FIRST usable cwd decides (later record cannot rescue)" 1 "$rc"
+
+# cmd_pull integration: a non-canonical remote parent is pulled only when
+# the remote transcript corroborates it; the sibling case refuses.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-project/sib1.jsonl"; }
+remote_sh() { printf '%s\n' "$FAKE_RCWD"; }
+remote_stat() { printf 'MISSING'; }
+compare_mtimes() { printf 'remote-missing'; }
+SIBRSYNC="$TMP/hp_sib_rsync"; : > "$SIBRSYNC"
+rsync() { printf '%s\n' "$*" >> "$SIBRSYNC"; }
+FORCE=0
+
+FAKE_RCWD="/home/alice-project"
+rc=0; out="$( (cmd_pull sib1) 2>&1 )" || rc=$?
+assert_rc "pull: uncorroborated non-canonical parent refuses" 1 "$rc"
+assert_match "pull: refusal explains the corroboration failure" "does not corroborate" "$out"
+assert_eq "pull: nothing was transferred on refusal" "" "$(cat "$SIBRSYNC")"
+
+FAKE_RCWD="/home/alice/project"
+rc=0; out="$( (cmd_pull sib1) 2>&1 )" || rc=$?
+assert_rc "pull: corroborated non-canonical parent proceeds" 0 "$rc"
+assert_match "pull: transfer targets the canonical local dir" "$LHP-project/sib1.jsonl" "$(cat "$SIBRSYNC")"
+
+# canonical (physical) remote parent needs NO corroboration round trip.
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-lustre-home-alice-code-app/can1.jsonl"; }
+HPCANLOG="$TMP/hp_can_rsh"; : > "$HPCANLOG"
+remote_sh() { echo called >> "$HPCANLOG"; printf '%s\n' "/should/never/be/read"; }
+: > "$SIBRSYNC"
+rc=0; (cmd_pull can1) >/dev/null 2>&1 || rc=$?
+assert_rc "pull: canonical parent pulls without corroboration" 0 "$rc"
+assert_eq "pull: canonical parent triggers no extra remote round trip" "" "$(cat "$HPCANLOG")"
+assert_match "pull: canonical parent lands in the translated local dir" "$LHP-code-app/can1.jsonl" "$(cat "$SIBRSYNC")"
+unset -f require_remote find_remote_session remote_sh remote_stat compare_mtimes rsync
+unset FAKE_RCWD
+
+# push side: a session under the non-canonical LOCAL encoding must be
+# corroborated by its own (local) transcript before translation.
+if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  LHOME_PHYS="$TMP/physhome"; LHOME_PHYS_FALLBACK=0
+  mkdir -p "$PROJECTS/$LHP-code-hp"
+  printf '{"cwd":"%s/code/hp"}\n' "$HOME" > "$PROJECTS/$LHP-code-hp/hpl1.jsonl"
+  printf '{"cwd":"%s/code/other"}\n' "$HOME" > "$PROJECTS/$LHP-code-hp/hpl2.jsonl"
+  require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+  remote_sh() { :; }
+  compare_mtimes() { printf 'remote-missing'; }
+  HPPRSYNC="$TMP/hp_push_rsync"; : > "$HPPRSYNC"
+  rsync() { printf '%s\n' "$*" >> "$HPPRSYNC"; }
+  FORCE=1
+
+  rc=0; (cmd_push hpl1) >/dev/null 2>&1 || rc=$?
+  assert_rc "push: corroborated non-canonical local parent proceeds" 0 "$rc"
+  assert_match "push: transfer ran for the corroborated session" "hpl1.jsonl" "$(cat "$HPPRSYNC")"
+
+  : > "$HPPRSYNC"
+  rc=0; out="$( (cmd_push hpl2) 2>&1 )" || rc=$?
+  assert_rc "push: uncorroborated non-canonical local parent refuses" 1 "$rc"
+  assert_match "push: local refusal explains the corroboration failure" "does not corroborate" "$out"
+  assert_eq "push: nothing was transferred on local refusal" "" "$(cat "$HPPRSYNC")"
+
+  # canonical local parent: no corroboration (a cwd-less transcript pushes).
+  LPPENC="$(encode_path "$TMP/physhome")"
+  mkdir -p "$PROJECTS/$LPPENC-code-hp"
+  printf '{"nocwd":true}\n' > "$PROJECTS/$LPPENC-code-hp/hpl3.jsonl"
+  : > "$HPPRSYNC"
+  rc=0; (cmd_push hpl3) >/dev/null 2>&1 || rc=$?
+  assert_rc "push: canonical local parent needs no corroboration" 0 "$rc"
+  assert_match "push: canonical-parent transfer ran" "hpl3.jsonl" "$(cat "$HPPRSYNC")"
+  unset -f require_remote remote_sh compare_mtimes rsync
+  FORCE=0; LHOME_PHYS=""; LHOME_PHYS_FALLBACK=0
+else
+  t_ok "push-side corroboration tests skipped (no jq/python3 on PATH)"
+fi
+
+# ---- HP4: duplicates fail closed (Blockers 2/3) ----
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+LHP="$(encode_path "$HOME")"
+SDIR="$PROJECTS/$LHP-code-p1"
+
+# find_local_session: physical/logical twins refuse with a migration hint.
+LHOME_PHYS="$TMP/physhome"; LHOME_PHYS_FALLBACK=0
+LPPENC="$(encode_path "$TMP/physhome")"
+mkdir -p "$PROJECTS/$LHP-code-twin" "$PROJECTS/$LPPENC-code-twin"
+printf '{}\n' > "$PROJECTS/$LHP-code-twin/tw1.jsonl"
+printf '{}\n' > "$PROJECTS/$LPPENC-code-twin/tw1.jsonl"
+rc=0; out="$( (find_local_session tw1) 2>&1 )" || rc=$?
+assert_rc "find_local_session: encoding twins refuse" 1 "$rc"
+assert_match "local twin refusal says home encoding" "local home encoding" "$out"
+assert_match "local twin refusal lists the physical twin path" "$LPPENC-code-twin" "$out"
+assert_match "local twin refusal carries a migration hint" "merge them manually" "$out"
+
+# same sid in two DIFFERENT projects keeps the generic ambiguity refusal.
+mkdir -p "$PROJECTS/$LHP-code-twa" "$PROJECTS/$LHP-code-twb"
+printf '{}\n' > "$PROJECTS/$LHP-code-twa/tw3.jsonl"
+printf '{}\n' > "$PROJECTS/$LHP-code-twb/tw3.jsonl"
+rc=0; out="$( (find_local_session tw3) 2>&1 )" || rc=$?
+assert_rc "find_local_session: distinct projects still refuse" 1 "$rc"
+assert_match "distinct-project refusal keeps the generic message" "ambiguous session id" "$out"
+
+# single-root seam: the same twin-shaped dirs get the GENERIC message when
+# no physical home is set (blast radius: message unchanged).
+LHOME_PHYS=""
+rc=0; out="$( (find_local_session tw1) 2>&1 )" || rc=$?
+assert_rc "find_local_session: single-root twin-shape still refuses" 1 "$rc"
+assert_match "single-root refusal keeps the generic message" "ambiguous session id" "$out"
+rm -rf "$PROJECTS/$LHP-code-twin" "$PROJECTS/$LPPENC-code-twin" "$PROJECTS/$LHP-code-twa" "$PROJECTS/$LHP-code-twb"
+
+# find_remote_session: remote twins refuse with the migration hint.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects
+remote_sh() { printf '%s\n%s\n' \
+  "/home/alice/.claude/projects/-home-alice-code-app/dup2.jsonl" \
+  "/home/alice/.claude/projects/-lustre-home-alice-code-app/dup2.jsonl"; }
+rc=0; out="$( (find_remote_session dup2) 2>&1 )" || rc=$?
+assert_rc "find_remote_session: encoding twins refuse" 1 "$rc"
+assert_match "remote twin refusal says home encoding" "home encoding" "$out"
+assert_match "remote twin refusal carries a migration hint" "merge them manually" "$out"
+remote_sh() { printf '%s\n%s\n' \
+  "/home/alice/.claude/projects/-home-alice-code-p1/dup3.jsonl" \
+  "/home/alice/.claude/projects/-home-alice-code-p2/dup3.jsonl"; }
+rc=0; out="$( (find_remote_session dup3) 2>&1 )" || rc=$?
+assert_rc "find_remote_session: distinct remote projects still refuse" 1 "$rc"
+assert_match "distinct remote projects keep the generic message" "ambiguous session id" "$out"
+unset -f remote_sh
+
+# push twin guard: a sid under the OTHER remote encoding refuses BEFORE any
+# backup/mkdir/rsync — and --force must NOT override.
+find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+session_cwd_local() { printf '%s' "$HOME/code/p1"; }
+TWSTATLOG="$TMP/hp_tw_stat"; : > "$TWSTATLOG"
+remote_stat() { printf '%s\n' "$1" >> "$TWSTATLOG"; case "$1" in */-home-alice-code-p1/*) printf '100 5' ;; *) printf 'MISSING' ;; esac; }
+TWRSH="$TMP/hp_tw_rsh"; : > "$TWRSH"
+remote_sh() { echo "rsh $*" >> "$TWRSH"; }
+TWRSYNC="$TMP/hp_tw_rsync"; : > "$TWRSYNC"
+rsync() { printf '%s\n' "$*" >> "$TWRSYNC"; }
+compare_mtimes() { printf 'remote-missing'; }
+
+FORCE=0
+rc=0; out="$( (cmd_push bbb) 2>&1 )" || rc=$?
+assert_rc "push: remote twin refuses" 1 "$rc"
+assert_match "push twin refusal lists the twin path" "-home-alice-code-p1/bbb.jsonl" "$out"
+assert_match "push twin refusal says --force does not override" "--force does not override" "$out"
+assert_eq "push twin refusal: no rsync ran" "" "$(cat "$TWRSYNC")"
+assert_eq "push twin refusal: no remote mkdir/backup ran" "" "$(cat "$TWRSH")"
+
+FORCE=1
+rc=0; (cmd_push bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "push: --force does not override the twin refusal" 1 "$rc"
+assert_eq "forced push twin refusal: still no rsync" "" "$(cat "$TWRSYNC")"
+assert_eq "forced push twin refusal: still no remote mkdir/backup" "" "$(cat "$TWRSH")"
+FORCE=0
+
+# twin absent -> push proceeds and lands in the CANONICAL (physical) name.
+remote_stat() { printf 'MISSING'; }
+: > "$TWRSYNC"
+rc=0; (cmd_push bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "push: proceeds when no twin exists" 0 "$rc"
+assert_match "push lands in the canonical physical encoding" "-lustre-home-alice-code-p1/bbb.jsonl" "$(cat "$TWRSYNC")"
+
+# twin state UNKNOWN (ssh/stat failed) -> fail closed.
+remote_stat() { return 3; }
+: > "$TWRSYNC"
+rc=0; out="$( (cmd_push bbb) 2>&1 )" || rc=$?
+assert_rc "push: unknown twin state refuses" 1 "$rc"
+assert_match "push unknown-twin refusal explains itself" "duplicate state is unknown" "$out"
+assert_eq "push unknown-twin refusal: no rsync ran" "" "$(cat "$TWRSYNC")"
+
+# single-root seam: the twin guard adds ZERO remote round trips — the only
+# remote_stat is the pre-existing shrink-guard stat of the destination
+# (dual-root runs above show twin-check + shrink-guard = 2 stats).
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+RHOME_PHYS=/home/alice
+: > "$TWSTATLOG"
+remote_stat() { printf '%s\n' "$1" >> "$TWSTATLOG"; printf 'MISSING'; }
+rc=0; (cmd_push bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "push: single root still succeeds" 0 "$rc"
+assert_eq "push: single root adds no twin stat (shrink-guard stat only)" "1" "$(grep -c . "$TWSTATLOG")"
+unset -f require_remote find_local_session session_cwd_local remote_stat remote_sh rsync compare_mtimes
+
+# handoff: twin refusal happens BEFORE the stop; a twin appearing AFTER the
+# preflight is caught by cmd_push's re-check and takes the recovery path.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+LHP="$(encode_path "$HOME")"
+SDIR="$PROJECTS/$LHP-code-p1"
+HOSTOP="$TMP/hp_ho_stop"; : > "$HOSTOP"
+HOSTAT="$TMP/hp_ho_stat"; : > "$HOSTAT"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'local-newer'; }
+session_cwd_local() { printf '%s' "$HOME/code/p1"; }
+stop_remote_claude() { echo stop >> "$HOSTOP"; }
+remote_sh() { :; }
+HORSYNC="$TMP/hp_ho_rsync"; : > "$HORSYNC"
+rsync() { printf '%s\n' "$*" >> "$HORSYNC"; }
+_recover_remote_op() { echo op-restart >> "$HOSTOP"; printf RESTARTED; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+
+# twin present at preflight -> refuse BEFORE stop, remote NOT stopped.
+remote_stat() { printf '100 5'; }
+rc=0; out="$( (cmd_handoff bbb) 2>&1 )" || rc=$?
+assert_rc "handoff: twin at preflight refuses" 1 "$rc"
+assert_match "handoff twin refusal says the remote was NOT stopped" "NOT stopped" "$out"
+assert_eq "handoff twin refusal: nothing stopped or transferred" "" "$(cat "$HOSTOP")"
+
+# twin appears between preflight and transfer -> post-stop re-check dies,
+# the armed trap runs recovery (normal recovery path).
+remote_stat() { echo x >> "$HOSTAT"; if [ "$(grep -c x "$HOSTAT")" -ge 2 ]; then printf '100 5'; else printf 'MISSING'; fi; }
+: > "$HOSTOP"; : > "$HORSYNC"
+rc=0; out="$( (cmd_handoff bbb) 2>&1 )" || rc=$?
+assert_rc "handoff: twin appearing post-stop fails the transfer" 1 "$rc"
+assert_match "handoff post-stop twin: the stop happened first" "stop" "$(cat "$HOSTOP")"
+assert_match "handoff post-stop twin: recovery restart attempted" "op-restart" "$(cat "$HOSTOP")"
+assert_eq "handoff post-stop twin: no rsync ran" "" "$(cat "$HORSYNC")"
+unset -f require_remote find_local_session find_remote_pane compare_mtimes session_cwd_local \
+  stop_remote_claude remote_sh rsync _recover_remote_op remote_stat
+
+# handback: twins refuse before the stop; post-stop rediscovery must never
+# silently switch source paths.
+HBSTOP="$TMP/hp_hb_stop"; : > "$HBSTOP"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$HBSTOP"; }
+remote_sh() { printf '%s\n%s\n' \
+  "/home/alice/.claude/projects/-home-alice-code-app/hbt.jsonl" \
+  "/home/alice/.claude/projects/-lustre-home-alice-code-app/hbt.jsonl"; }
+NO_STOP=0; NO_EXTRAS=1; FORCE=0
+rc=0; out="$( (cmd_handback hbt) 2>&1 )" || rc=$?
+assert_rc "handback: remote twins refuse (via find_remote_session)" 1 "$rc"
+assert_match "handback twin refusal carries the migration hint" "merge them manually" "$out"
+assert_eq "handback twin refusal: remote never stopped" "" "$(cat "$HBSTOP")"
+unset -f remote_sh
+
+# source-switch: rediscovery inside the pull returns a DIFFERENT path.
+HBSW="$TMP/hp_hb_switch"; : > "$HBSW"
+HBSWCNT="$TMP/hp_hb_swcnt"; : > "$HBSWCNT"
+find_remote_session() {
+  echo x >> "$HBSWCNT"
+  if [ "$(grep -c x "$HBSWCNT")" -ge 2 ]; then
+    printf '%s' "/home/alice/.claude/projects/-home-alice-code-app/hbs.jsonl"
+  else
+    printf '%s' "/home/alice/.claude/projects/-lustre-home-alice-code-app/hbs.jsonl"
+  fi
+}
+stop_remote_claude() { echo stop >> "$HBSW"; }
+remote_stat() { printf 'MISSING'; }
+rsync() { echo "rsync $*" >> "$HBSW"; }
+remote_sh() { :; }
+_recover_remote_op() { echo op-restart >> "$HBSW"; printf RESTARTED; }
+rc=0; out="$( (cmd_handback hbs) 2>&1 )" || rc=$?
+assert_rc "handback: post-stop source switch refuses" 1 "$rc"
+assert_match "handback source-switch refusal names the move" "moved between preflight and pull" "$out"
+assert_match "handback source-switch: recovery restart attempted" "op-restart" "$(cat "$HBSW")"
+assert_eq "handback source-switch: nothing was transferred" "" "$(grep rsync "$HBSW" || true)"
+unset -f require_remote find_remote_pane compare_mtimes stop_remote_claude \
+  find_remote_session remote_stat rsync remote_sh _recover_remote_op
+NO_EXTRAS=0
+
+# ---- HP4b: sync-all with dual remote encodings (Blocker 4, minimal-safe) ----
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/sa_projects"; mkdir -p "$PROJECTS"
+LHP="$(encode_path "$HOME")"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+PROJECT_ROOTS=(); PROJECT_CLAUDE_EXTRAS=(); SESSION_DIR_EXTRAS=(); HOME_RELATIVE_EXTRAS=()
+REQUIRE_CLEAN=0
+SARSH="$TMP/hp_sa_rsh"; SARSYNC="$TMP/hp_sa_rsync"
+sa_remote_sh() {  # $FAKE_SA_DIRS (newline-separated) drives both discovery rounds
+  case "$1" in
+    *find*-maxdepth\ 1*) echo find-call >> "$SARSH"; printf '%s\n' "$FAKE_SA_DIRS" ;;
+    *mkdir*)             echo "mkdir $2" >> "$SARSH" ;;
+    *) : ;;
+  esac
+}
+remote_sh() { sa_remote_sh "$@"; }
+rsync() { printf 'rsync %s\n' "$*" >> "$SARSYNC"; }
+
+# (a) data ONLY under the non-canonical encoding: READ from the actual dir,
+# WRITE to the canonical destination.
+FAKE_SA_DIRS="-home-alice-code-sa1"
+: > "$SARSH"; : > "$SARSYNC"
+rc=0; out="$( (cmd_sync_all both) 2>&1 )" || rc=$?
+assert_rc "sync-all: non-canonical-only project syncs" 0 "$rc"
+assert_match "sync-all: remote mkdir targets the CANONICAL dir" "mkdir /home/alice/.claude/projects/-lustre-home-alice-code-sa1" "$(cat "$SARSH")"
+assert_match "sync-all: to-remote write goes to the CANONICAL dir" "stub:/home/alice/.claude/projects/-lustre-home-alice-code-sa1/" "$(cat "$SARSYNC")"
+assert_match "sync-all: from-remote read comes from the ACTUAL (non-canonical) dir" "stub:/home/alice/.claude/projects/-home-alice-code-sa1/ " "$(cat "$SARSYNC")"
+
+# (b) BOTH encodings hold data: failed step + migration hint, nothing synced.
+FAKE_SA_DIRS="-home-alice-code-sa1
+-lustre-home-alice-code-sa1"
+: > "$SARSH"; : > "$SARSYNC"
+rc=0; out="$( (cmd_sync_all both) 2>&1 )" || rc=$?
+assert_rc "sync-all: both-encodings project is a FAILED step" 1 "$rc"
+assert_match "sync-all: both-encodings warning names both dirs" "BOTH home encodings" "$out"
+assert_match "sync-all: the sweep reports the failed step count" "failed step" "$out"
+assert_eq "sync-all: both-encodings project transferred nothing" "" "$(cat "$SARSYNC")"
+
+# (c) single root: byte-identical behavior, and NO extra discovery round.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+FAKE_SA_DIRS="-home-alice-code-sa1"
+: > "$SARSH"; : > "$SARSYNC"
+rc=0; out="$( (cmd_sync_all both) 2>&1 )" || rc=$?
+assert_rc "sync-all: single root still succeeds" 0 "$rc"
+assert_match "sync-all: single root reads and writes the same dir" "stub:/home/alice/.claude/projects/-home-alice-code-sa1/" "$(cat "$SARSYNC")"
+assert_eq "sync-all: single root runs exactly ONE remote discovery" "1" "$(grep -c find-call "$SARSH")"
+unset -f require_remote remote_sh rsync sa_remote_sh
+unset FAKE_SA_DIRS
+load_config
+PROJECTS="$TMP/projects"
+
+# ---- HP5: raw-path mapping (Blocker 5, scoped) ----
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+LHP="$(encode_path "$HOME")"
+
+# a remote transcript recorded under the PHYSICAL remote home resolves to
+# the local project, and the remote emission stays under the LOGICAL $RHOME.
+mkdir -p "$PROJECTS/$LHP-code-rp"
+printf '{"cwd":"/lustre/home/alice/code/rp"}\n' > "$PROJECTS/$LHP-code-rp/rp1.jsonl"
+printf '{"cwd":"/home/alice/code/rp"}\n' > "$PROJECTS/$LHP-code-rp/rp2.jsonl"
+assert_eq "raw: physical remote cwd resolves to the local project" "$HOME/code/rp" "$(session_cwd_local rp1)"
+assert_eq "raw: logical remote cwd resolves identically" "$HOME/code/rp" "$(session_cwd_local rp2)"
+require_remote() { :; }
+REMOTE=stub; RHOME="/home/alice"; RHOME_PHYS="/lustre/home/alice"
+assert_eq "raw: emission stays under the LOGICAL remote home (physical transcript)" "/home/alice/code/rp" "$(session_cwd_remote rp1)"
+assert_eq "raw: emission stays under the LOGICAL remote home (logical transcript)" "/home/alice/code/rp" "$(session_cwd_remote rp2)"
+
+# a LOCAL cwd under the local PHYSICAL home maps to logical $RHOME with the
+# same relative suffix; a raw-boundary sibling still refuses.
+LHOME_PHYS="$TMP/physhome"; LHOME_PHYS_FALLBACK=0
+LPPENC="$(encode_path "$TMP/physhome")"
+mkdir -p "$PROJECTS/$LPPENC-code-rp"
+printf '{"cwd":"%s/code/rp"}\n' "$TMP/physhome" > "$PROJECTS/$LPPENC-code-rp/rp3.jsonl"
+assert_eq "raw: local physical cwd emits under logical \$RHOME" "/home/alice/code/rp" "$(session_cwd_remote rp3)"
+mkdir -p "$PROJECTS/$(encode_path "${HOME}zz")-code-rp"
+printf '{"cwd":"%szz/code/rp"}\n' "$HOME" > "$PROJECTS/$(encode_path "${HOME}zz")-code-rp/rp4.jsonl"
+rc=0; (session_cwd_remote rp4) >/dev/null 2>&1 || rc=$?
+assert_rc "raw: a raw-boundary sibling of \$HOME still refuses emission" 1 "$rc"
+LHOME_PHYS=""; LHOME_PHYS_FALLBACK=0
+unset -f require_remote
+
+# handback end-to-end: physical-home remote transcript cwd -> local project
+# dir for extras, remote extras path emitted under the LOGICAL $RHOME.
+HBRAW="$TMP/hp_hb_raw"; : > "$HBRAW"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-lustre-home-alice-code-rp/hbrp.jsonl"; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$HBRAW"; }
+cmd_pull() { echo pull >> "$HBRAW"; }
+remote_sh() { printf '/lustre/home/alice/code/rp\n'; }
+cmd_sync_extras() { echo "extras $*" >> "$HBRAW"; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; (cmd_handback hbrp) >/dev/null 2>&1 || rc=$?
+assert_rc "handback: physical-cwd remote transcript hands back" 0 "$rc"
+assert_match "handback: extras got the mapped LOCAL project dir" "extras hbrp from-remote $HOME/code/rp" "$(cat "$HBRAW")"
+assert_match "handback: extras remote path emitted under LOGICAL \$RHOME" "$HOME/code/rp /home/alice/code/rp" "$(cat "$HBRAW")"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes \
+  stop_remote_claude cmd_pull remote_sh cmd_sync_extras
+
+# ---- HP6: doctor reporting ----
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+DOCSCAN="$TMP/hp_doc_scan"; : > "$DOCSCAN"
+FAKE_TWIN_SCAN=""
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RHOME_PHYS_FALLBACK=0; RPROJECTS=/home/alice/.claude/projects; }
+remote_sh() {
+  case "$1" in
+    *NONCANON*) echo twinscan >> "$DOCSCAN"; printf '%s\n' "$FAKE_TWIN_SCAN" ;;
+    *) printf 'ok   remote rsync present\n' ;;
+  esac
+}
+REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE="stubhost"
+
+# differing homes: report the pair, non-canonical dirs, and duplicate sids
+# on SEPARATE lines; warns only (doctor still passes).
+FAKE_TWIN_SCAN='NONCANON -home-alice-code-app
+DUP dup1 -home-alice-code-app <-> -lustre-home-alice-code-app'
+rc=0; out="$(cmd_doctor 2>&1)" || rc=$?
+assert_rc "doctor: dual-root report is warn-only (exit 0)" 0 "$rc"
+assert_match "doctor reports the logical+physical home pair" "remote home: /home/alice (physical: /lustre/home/alice" "$out"
+assert_match "doctor reports the non-canonical dir on its own line" "non-canonical home encoding: -home-alice-code-app" "$out"
+assert_match "doctor reports the duplicate sid on its own line" "duplicate session under both home encodings: dup1" "$out"
+
+# scan failure = UNKNOWN, never "no twins".
+FAKE_TWIN_SCAN='SCANFAIL find'
+out="$(cmd_doctor 2>&1)" || true
+assert_match "doctor: twin scan failure reports UNKNOWN" "twin state UNKNOWN" "$out"
+remote_sh() { case "$1" in *NONCANON*) return 255 ;; *) printf 'ok   remote rsync present\n' ;; esac; }
+out="$(cmd_doctor 2>&1)" || true
+assert_match "doctor: twin scan ssh failure reports UNKNOWN" "twin state UNKNOWN" "$out"
+
+# probe fallback is reported distinctly, and skips the twin scan.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/home/alice; RHOME_PHYS_FALLBACK=1; RPROJECTS=/home/alice/.claude/projects; }
+remote_sh() { case "$1" in *NONCANON*) echo twinscan >> "$DOCSCAN"; printf '\n' ;; *) printf 'ok   remote rsync present\n' ;; esac; }
+: > "$DOCSCAN"
+out="$(cmd_doctor 2>&1)" || true
+assert_match "doctor: probe fallback reported distinctly" "physical-home probe failed" "$out"
+assert_eq "doctor: probe fallback skips the twin scan" "" "$(cat "$DOCSCAN")"
+
+# equal homes: no physical-home line at all (byte-level blast radius).
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/home/alice; RHOME_PHYS_FALLBACK=0; RPROJECTS=/home/alice/.claude/projects; }
+: > "$DOCSCAN"
+out="$(cmd_doctor 2>&1)" || true
+case "$out" in
+  *"physical:"*) t_fail "doctor: equal homes print no physical line" "output: $out" ;;
+  *) t_ok "doctor: equal homes print no physical line" ;;
+esac
+assert_eq "doctor: equal homes run no twin scan" "" "$(cat "$DOCSCAN")"
+unset -f require_remote remote_sh
+REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
+unset FAKE_TWIN_SCAN
+
 t_summary
