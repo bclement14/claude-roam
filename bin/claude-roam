@@ -1356,7 +1356,7 @@ command -v pgrep >/dev/null 2>&1 || { echo NOTOOLS; exit 0; }
 pgrep -f "claude --resume[= ]${sid_re}( |\$)" >/dev/null 2>&1; prc=$?
 [ "$prc" -eq 0 ] && { echo RUNNING; exit 0; }
 [ "$prc" -gt 1 ] && { echo "ERROR $prc"; exit 0; }
-command -v tmux >/dev/null 2>&1 || { echo NOTOOLS; exit 0; }
+for t in tmux grep; do command -v "$t" >/dev/null 2>&1 || { echo NOTOOLS; exit 0; }; done
 tmux list-panes -a -F "#{pane_id}" 2>/dev/null | grep -qx "$pane" || { echo NOPANEID; exit 0; }
 tmux send-keys -t "$pane" "claude --resume $sidlit" Enter 2>/dev/null && echo RESTARTED || echo SENDFAIL
 exit 0' "$pane" "$sid_re" "$sid"

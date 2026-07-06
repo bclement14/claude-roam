@@ -1558,4 +1558,29 @@ out="$( (stop_remote_claude sess %1) 2>&1 )" || true
 assert_match "stop 2 -> pgrep-error/unknown message" "pgrep errored" "$out"
 unset -f remote_sh; unset REMOTE
 
+# ============================================================================
+# H5 nit: _recover_remote_op's tool check must include grep
+# ============================================================================
+# The op's pane-existence check pipes `tmux list-panes` through grep; without
+# a grep presence check a grep-less remote would misreport NOPANEID. It must
+# answer NOTOOLS ("cannot verify") instead — and never type into the pane.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+export REMOTE=stub
+export FAKE_SEND_LOG="$TMP/sendlog_nogrep"
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
+PANEBIN="$(mk_panebin recov_nogrep pgrep ps tmux)"
+rm -f "$PANEBIN/grep"
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%1"
+assert_eq "op: no match + grep missing -> NOTOOLS (not NOPANEID)" "NOTOOLS" "$(_recover_remote_op sess %1)"
+assert_eq "op: grep-missing NOTOOLS never types" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+# decision layer on top of the same grep-less remote: "cannot verify" + manual
+# hint, no restart.
+out="$(_recover_restart sess %1 2>&1)"
+assert_match "recover(no-grep): cannot-verify message" "cannot verify" "$out"
+assert_match "recover(no-grep): manual hint" "manual recovery" "$out"
+assert_eq "recover(no-grep): never types into the pane" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG
+unset -f remote_sh; unset REMOTE
+
 t_summary
