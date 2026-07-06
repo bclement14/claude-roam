@@ -2980,4 +2980,38 @@ assert_rc "F7: overlapping roots — neither relative reading matching refuses" 
 rm -f "$PROJECTS/$LHP-sub-code-app/f7x1.jsonl"
 REMOTE=""; RHOME=""; RHOME_PHYS=""
 
+# ---- claude-encoding parity: '_' and '.' collapse to '-' in claude's dir
+# names (found by the live cluster pull: cwd .../kt_playground/fine_tuning
+# vs claude's dir ...-kt-playground-fine-tuning was falsely refused).
+# Comparisons against claude-created names must normalize BOTH sides.
+assert_eq "claude_norm: underscores and dots collapse" "-a-b-c-d" "$(_claude_norm "-a_b-c.d")"
+# corroboration: the exact cluster shape — underscore cwd, hyphen tail
+RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice
+rc=0; _corroborate_parent_tail "-learning-domain-mapping-kt-playground-fine-tuning" \
+  "/lustre/home/alice/learning-domain-mapping/kt_playground/fine_tuning" "t" || rc=$?
+assert_rc "claude_norm: underscore cwd corroborates claude's hyphen tail" 0 "$rc"
+# dot case
+rc=0; _corroborate_parent_tail "-code-poc-app" "/home/alice/code/poc.app" "t" || rc=$?
+assert_rc "claude_norm: dotted cwd corroborates claude's hyphen tail" 0 "$rc"
+# the lossy SIBLING must still refuse (normalization must not reopen it)
+rc=0; (_corroborate_parent_tail "-project" "/lustre/home/alice-project" "t") >/dev/null 2>&1 || rc=$?
+assert_rc "claude_norm: outside-home sibling still refused" 1 "$rc"
+# a genuinely different tail must still refuse
+rc=0; (_corroborate_parent_tail "-code-other" "/home/alice/code/poc.app" "t") >/dev/null 2>&1 || rc=$?
+assert_rc "claude_norm: wrong tail still refused" 1 "$rc"
+# F7 resolver: root-relative mapping with underscores
+RHOME=/home/alice; RHOME_PHYS=""
+rc=0; out="$(_resolve_cwd_candidate "/home/alice/kt_playground/ft" "$LHP-kt-playground-ft" "$LHP")" || rc=$?
+assert_rc "claude_norm: resolver accepts underscore cwd via hyphen parent" 0 "$rc"
+assert_eq "claude_norm: resolver maps underscore cwd to \$HOME-relative path" \
+  "$HOME/kt_playground/ft" "$out"
+# F7 resolver: outside-home DIRECT match with underscores
+rc=0; out="$(_resolve_cwd_candidate "/opt/my_tool" "-opt-my-tool" "$LHP")" || rc=$?
+assert_rc "claude_norm: direct outside-home underscore match accepted" 0 "$rc"
+assert_eq "claude_norm: direct outside-home match returns the raw path" "/opt/my_tool" "$out"
+# foreign root still refused
+rc=0; (_resolve_cwd_candidate "/evil/kt_playground/ft" "$LHP-kt-playground-ft" "$LHP") >/dev/null || rc=$?
+assert_rc "claude_norm: foreign root still refused by resolver" 1 "$rc"
+REMOTE=""; RHOME=""; RHOME_PHYS=""
+
 t_summary

@@ -71,6 +71,17 @@ validate_int() {
 # Encoded form of an absolute path: /Users/alice -> -Users-alice
 encode_path() { printf -- '-%s' "${1#/}" | tr '/' '-'; }
 
+# Claude Code names a project dir by replacing EVERY character outside
+# [A-Za-z0-9] with '-' — underscores and dots too, not just '/'. Any
+# comparison against a claude-created dir name must therefore happen in
+# that normalized space: encode_path alone keeps '_' and '.', and would
+# falsely refuse a legitimate dir (real case: cwd .../kt_playground/
+# fine_tuning vs claude's dir ...-kt-playground-fine-tuning). Normalizing
+# BOTH sides is idempotent on names claude already encoded, and cannot
+# reopen the lossy-sibling hole — that is closed earlier by the raw '/'
+# boundary root match, before any encoded comparison.
+_claude_norm() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9' '-'; }
+
 # ---- config ----
 
 # Entries must be $HOME-relative, one path segment or nested, and free of
@@ -460,8 +471,8 @@ EOF
   for root in "$HOME" "$(local_home_phys)" "$RHOME" "$(remote_home_phys)"; do
     [ -n "$root" ] || continue
     if [ "$first" = "$root" ] || [[ "$first" == "$root"/* ]]; then
-      enc_rel="$(printf '%s' "${first#"$root"}" | tr '/' '-')"
-      if [ "$enc_rel" = "$tail" ]; then return 0; fi
+      enc_rel="$(_claude_norm "${first#"$root"}")"
+      if [ "$enc_rel" = "$(_claude_norm "$tail")" ]; then return 0; fi
     fi
   done
   die "$label: the transcript's cwd '$first' does not corroborate the encoded project dir (lossy '-' encoding — e.g. /home/alice/project vs the sibling /home/alice-project); refusing to translate. Inspect the directory and migrate it manually if it is legitimate"
@@ -963,7 +974,7 @@ _clean_abs_cwd() {
 #                  under a genuine accepted root.
 _resolve_cwd_candidate() {
   local c="$1" parent="$2" lhp="$3" leph ptail have_tail=0 root rel
-  if [ "$(encode_path "$c")" = "$parent" ]; then
+  if [ "$(_claude_norm "$(encode_path "$c")")" = "$(_claude_norm "$parent")" ]; then
     printf '%s' "$c"
     return 0
   fi
@@ -981,7 +992,7 @@ _resolve_cwd_candidate() {
     [ -n "$root" ] || continue
     if [ "$c" = "$root" ] || [[ "$c" == "$root"/* ]]; then
       rel="${c#"$root"}"
-      if [ "$(printf '%s' "$rel" | tr '/' '-')" = "$ptail" ]; then
+      if [ "$(_claude_norm "$rel")" = "$(_claude_norm "$ptail")" ]; then
         printf '%s%s' "$HOME" "$rel"
         return 0
       fi
