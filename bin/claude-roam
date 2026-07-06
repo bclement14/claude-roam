@@ -1476,8 +1476,13 @@ cmd_sync_all() {
   # right here, before the loop consumes the (possibly incomplete) output.
   sdirs="$(union_session_dirs)" || sdirs_rc=$?
   if [ "$sdirs_rc" -ne 0 ]; then
+    # Fail closed exactly like a twin-scan failure below: with discovery
+    # incomplete the remote directory set is UNKNOWN, so a canonical write
+    # here could create a twin of (or clobber) data living under an
+    # undiscovered encoding. Zero session-dir mutation; extras continue.
     FAILED_N=$((FAILED_N+1))
-    log "  WARN: remote discovery failed — union may be incomplete"
+    log "  WARN: remote discovery failed — union incomplete; skipping ALL session-directory transfers (nothing was written)"
+    skip_sessions=1
   fi
   # Dual remote encodings: fetch the raw remote dir names once so every
   # union entry (whose two encodings collapse into ONE canonical key) can be

@@ -2684,6 +2684,46 @@ assert_match "F3: unrelated home-extras section still ran" "f3notes" "$(cat "$F3
 unset -f require_remote remote_sh rsync _sync_to _sync_from
 load_config
 
+# ---- F3b: failed INITIAL discovery must also cause ZERO session-dir writes ----
+# The FIRST union scan fails (leaving a partial, local-only union) while the
+# second/twin scan succeeds empty: the remote directory set is still unknown
+# for the undiscovered dirs, so the entire session-dir section must be
+# skipped (fail closed) rather than processed from the partial union.
+require_remote() { REMOTE=stub; RHOME=/home/alice; RHOME_PHYS=/lustre/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+PROJECT_ROOTS=(); PROJECT_CLAUDE_EXTRAS=(); SESSION_DIR_EXTRAS=(); HOME_RELATIVE_EXTRAS=(f3bnotes)
+REQUIRE_CLEAN=0
+mkdir -p "$PROJECTS/$LHP-code-f3b"; printf '{}\n' > "$PROJECTS/$LHP-code-f3b/f3b.jsonl"
+F3BCNT="$TMP/f3b_cnt"; : > "$F3BCNT"
+F3BRSH="$TMP/f3b_rsh"; : > "$F3BRSH"
+F3BRSYNC="$TMP/f3b_rsync"; : > "$F3BRSYNC"
+F3BMKDIR="$TMP/f3b_mkdir"; : > "$F3BMKDIR"
+F3BEXTRAS="$TMP/f3b_extras"; : > "$F3BEXTRAS"
+remote_sh() {
+  case "$1" in
+    *find*-maxdepth\ 1*)
+      echo x >> "$F3BCNT"
+      # 1st find = union discovery (FAILS rc 42 -> partial union); 2nd =
+      # twin adjudication scan (succeeds, empty) -- the sequence under test.
+      if [ "$(grep -c x "$F3BCNT")" -eq 1 ]; then return 42; fi
+      : ;;
+    *mkdir*) echo "remote-mkdir $2" >> "$F3BRSH" ;;
+    *) : ;;
+  esac
+}
+rsync() { printf 'rsync %s\n' "$*" >> "$F3BRSYNC"; }
+_sync_to() { echo "sync_to $*" >> "$F3BEXTRAS"; }
+_sync_from() { echo "sync_from $*" >> "$F3BEXTRAS"; }
+rc=0; out="$( ( mkdir() { echo "local-mkdir $*" >> "$F3BMKDIR"; }; cmd_sync_all both ) 2>&1 )" || rc=$?
+assert_rc "F3b: failed initial discovery makes sync-all fail overall" 1 "$rc"
+assert_match "F3b: warning says session transfers are skipped" "skipping ALL session-directory transfers" "$out"
+assert_eq "F3b: zero rsync calls (either direction)" "" "$(cat "$F3BRSYNC")"
+assert_eq "F3b: zero remote mkdir calls" "" "$(cat "$F3BRSH")"
+assert_eq "F3b: zero local mkdir calls" "" "$(cat "$F3BMKDIR")"
+assert_match "F3b: unrelated home-extras section still ran" "f3bnotes" "$(cat "$F3BEXTRAS")"
+unset -f require_remote remote_sh rsync _sync_to _sync_from
+rm -rf "$PROJECTS/$LHP-code-f3b"
+load_config
+
 # ---- F5: push global-sid preflight (any other remote location refuses) ----
 # shellcheck disable=SC1090
 . "$REPO_DIR/bin/claude-roam"
