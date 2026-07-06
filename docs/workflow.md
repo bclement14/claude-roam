@@ -130,7 +130,10 @@ cd "$(claude-roam project "<sid>")" && git pull --ff-only
 
 Pass `--no-stop` only when you know the remote isn't actively running the
 session (e.g. it already exited on its own) and want to skip the stop
-attempt.
+attempt. `--no-stop` applies to **both** `handoff` and `handback`: it skips
+pane discovery, the stop, and (for `handoff`) the restart entirely, so it is
+your responsibility to have stopped the remote writer first — otherwise the
+transfer can race a live writer.
 
 ## `sync-all`: the blanket sweep
 

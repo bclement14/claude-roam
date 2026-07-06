@@ -66,7 +66,8 @@ flags:
                       set in config)
   --force             overwrite JSONL even if the destination is newer
   --no-extras         skip the sync-extras step inside handoff / handback
-  --no-stop           handback: do not stop a running remote claude first
+  --no-stop           handoff/handback: skip pane discovery + stop + restart
+                      (assumes you already stopped the remote claude yourself)
   --require-clean     push/handoff/sync-all: refuse (instead of warn) if a
                       session's project repo has uncommitted or unpushed work
 ```

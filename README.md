@@ -110,7 +110,7 @@ claude-roam doctor                   check prerequisites (local, and remote if c
 | `--remote <host>` | Override the configured remote for this run |
 | `--force` | Skip the newer-side mtime/size check |
 | `--no-extras` | Skip the `sync-extras` step inside `handoff` / `handback` |
-| `--no-stop` | `handback`: don't stop a running remote claude first |
+| `--no-stop` | `handoff`/`handback`: skip pane discovery, the stop, and (handoff) the restart — assumes you already stopped the remote claude yourself |
 | `--require-clean` | `push`/`handoff`/`sync-all`: refuse (instead of warn) if a session's project repo has uncommitted or unpushed work |
 | `-h`, `--help` | Show usage |
 
