@@ -263,13 +263,17 @@ assert_rc "handoff succeeds local-newer" 0 "$rc"
 assert_eq "handoff order preflight,stop,push,repopull,extras,restart" \
   "preflight stop push repopull extras restart" "$(tr '\n' ' ' < "$CALLS" | sed 's/ *$//')"
 
-# trap recovery: failure after stop must still attempt restart
+# trap recovery: failure after stop must still attempt restart. Recovery now
+# goes through the safe re-check+restart op (_recover_remote_op); stub it to
+# report "no matching process -> restarted" so the trap's restart is observable.
 : > "$CALLS"; cmd_repo_pull() { echo repopull >> "$CALLS"; return 1; }
+_recover_remote_op() { echo restart >> "$CALLS"; printf RESTARTED; }
 rc=0; (cmd_handoff bbb) >/dev/null 2>&1 || rc=$?
 assert_rc "handoff propagates failure" 1 "$rc"
 assert_match "trap attempted restart after failure" "restart" "$(cat "$CALLS")"
 unset -f require_remote find_local_session find_remote_pane compare_mtimes \
-  stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras restart_remote_claude session_cwd_local
+  stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras restart_remote_claude \
+  session_cwd_local _recover_remote_op
 
 # ---- Task 12: doctor ----
 REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
@@ -774,13 +778,15 @@ session_cwd_remote() { return 1; }                          # later read: unreso
 stop_remote_claude() { echo stop >> "$CALLS2"; }
 cmd_push() { echo push >> "$CALLS2"; }
 remote_sh() { :; }
-restart_remote_claude() { echo restart >> "$CALLS2"; }
+# Recovery now flows through the safe re-check+restart op; stub it to report a
+# clean restart so the trap's recovery action stays observable.
+_recover_remote_op() { echo restart >> "$CALLS2"; printf RESTARTED; }
 NO_EXTRAS=0; NO_STOP=0; FORCE=0
 rc=0; (cmd_handoff h6a) >/dev/null 2>&1 || rc=$?
 assert_rc "H6.22 handoff propagates a post-preflight resolver failure" 1 "$rc"
 assert_match "H6.22 handoff attempted restart after the failure" "restart" "$(cat "$CALLS2")"
 unset -f require_remote find_local_session find_remote_pane compare_mtimes \
-  session_cwd_local session_cwd_remote stop_remote_claude cmd_push remote_sh restart_remote_claude
+  session_cwd_local session_cwd_remote stop_remote_claude cmd_push remote_sh _recover_remote_op
 
 # ---- H6 audit fixes: D1 (jq/python3 required for cwd extraction), ----
 # ---- D2 (validate transfer paths BEFORE the remote stop),          ----
@@ -1337,5 +1343,219 @@ assert_match "handoff --no-stop prints a manual start hint" "claude --resume" "$
 unset -f require_remote find_local_session find_remote_pane compare_mtimes \
   stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras restart_remote_claude session_cwd_local
 NO_STOP=0
+
+# ============================================================================
+# H5 commit 2: arm-before-stop, state-aware recovery, handback pull-window trap
+# ============================================================================
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+SDIR="$PROJECTS/$(encode_path "$HOME")-code-p1"
+ho_stubs() {  # the shared handoff happy-path stub set
+  require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+  find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+  find_remote_pane() { printf '%s' 'OK %1'; }
+  compare_mtimes() { printf 'local-newer'; }
+  cmd_push() { echo push >> "$C2"; }
+  cmd_repo_pull() { echo repopull >> "$C2"; }
+  cmd_sync_extras() { echo extras >> "$C2"; }
+  session_cwd_local() { printf '%s' "$HOME/code/p1"; }
+}
+ho_unstub() { unset -f require_remote find_local_session find_remote_pane compare_mtimes \
+  cmd_push cmd_repo_pull cmd_sync_extras session_cwd_local stop_remote_claude \
+  restart_remote_claude _recover_remote_op; }
+
+# -- (A) H1 recovery matrix at the decision layer: _recover_restart must type
+# -- into the pane ONLY when the op positively reports RESTARTED (i.e. the
+# -- remote confirmed nothing was running and already restarted it). Every
+# -- other outcome -> a manual hint, never a blind restart.
+export REMOTE=stub
+OP_OUT=""; OP_RC=0
+_recover_remote_op() { printf '%s' "$OP_OUT"; return "$OP_RC"; }
+# spec: <op-output>|<needle in log>|<restarted? yes/no>   (OP_RC=0 for all)
+for spec in \
+  "RESTARTED|restarted it|yes" \
+  "RUNNING|still running|no" \
+  "ERROR 2|NOT restarting|no" \
+  "NOTOOLS|NOT restarting|no" \
+  "NOPANEID|no longer exists|no" \
+  "SENDFAIL|send-keys failed|no" \
+  "|unexpected|no" \
+  "WEIRD|unexpected|no"; do
+  OP_OUT="${spec%%|*}"; rest="${spec#*|}"; needle="${rest%%|*}"; want="${rest#*|}"
+  OP_RC=0
+  out="$(_recover_restart sess %1 2>&1)"
+  label="${OP_OUT:-<empty>}"
+  assert_match "recover($label): logs '$needle'" "$needle" "$out"
+  case "$out" in *"restarted it"*) got=yes ;; *) got=no ;; esac
+  assert_eq "recover($label): restart=$want" "$want" "$got"
+done
+# ssh/transport failure (op returns nonzero) -> no restart, manual hint
+OP_OUT="RESTARTED"; OP_RC=255
+out="$(_recover_restart sess %1 2>&1)"
+assert_match "recover(ssh-fail): manual hint" "manual recovery" "$out"
+case "$out" in *"restarted it"*) t_fail "recover(ssh-fail): must NOT restart" "$out" ;; *) t_ok "recover(ssh-fail): no restart" ;; esac
+unset -f _recover_remote_op
+unset OP_OUT OP_RC REMOTE
+
+# -- (B) _recover_remote_op at the SCRIPT level: restart happens exactly once
+# -- and ONLY when pgrep confirms no match, rechecked immediately before the
+# -- send-keys (the probe/restart race narrowed to one op). A send-keys log
+# -- records any type into the pane. (Block A unset -f'd the real op; re-source
+# -- to restore the genuine implementation before running it for real.)
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+cat > "$TMP/fake_tmux" <<'FEOF'
+#!/bin/bash
+case "${1:-}" in
+  list-panes) [ "${FAKE_TMUX_RC:-0}" != 0 ] && exit "$FAKE_TMUX_RC"
+              printf '%s\n' "${FAKE_PANES:-}"; exit 0 ;;
+  send-keys)  [ -n "${FAKE_SEND_LOG:-}" ] && echo "send $*" >> "$FAKE_SEND_LOG"
+              exit "${FAKE_SEND_RC:-0}" ;;
+  display-message) printf '%s\n' "${FAKE_SESSION:-}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+FEOF
+export REMOTE=stub
+export FAKE_SEND_LOG="$TMP/sendlog"
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
+PANEBIN="$(mk_panebin recov pgrep ps tmux)"
+
+# no match + pane present -> RESTARTED, exactly one send-keys
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%1"
+assert_eq "op: no match + pane -> RESTARTED" "RESTARTED" "$(_recover_remote_op sess %1)"
+assert_eq "op: RESTARTED typed exactly once" "1" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+
+# a matching process is present -> RUNNING, NO send-keys (idempotent / FM5;
+# the recheck-before-type that narrows the probe->restart race, H4)
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=0 FAKE_PGREP_OUT="1234"
+assert_eq "op: match present -> RUNNING" "RUNNING" "$(_recover_remote_op sess %1)"
+assert_eq "op: RUNNING never types into the pane" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+
+# pgrep errors -> ERROR, never restart (H3)
+export FAKE_PGREP_RC=2
+: > "$FAKE_SEND_LOG"
+assert_eq "op: pgrep error -> ERROR 2" "ERROR 2" "$(_recover_remote_op sess %1)"
+assert_eq "op: ERROR never types" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+
+# no match but the stored pane id is gone/reused -> NOPANEID, no send-keys
+export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%2"
+: > "$FAKE_SEND_LOG"
+assert_eq "op: missing pane id -> NOPANEID" "NOPANEID" "$(_recover_remote_op sess %1)"
+assert_eq "op: NOPANEID never types" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG
+unset -f remote_sh; unset REMOTE
+
+# -- (C) arm-before-stop (FM1): a failure DURING the stop (before any transfer)
+# -- must still reach recovery, and the original exit code is preserved.
+C2="$TMP/c2_abs"; : > "$C2"
+ho_stubs
+stop_remote_claude() { echo stop >> "$C2"; exit 7; }   # dies mid-stop
+_recover_remote_op() { echo op-restart >> "$C2"; printf RESTARTED; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; (cmd_handoff bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "arm-before-stop: exit code from a failed stop is preserved" 7 "$rc"
+assert_match "arm-before-stop: recovery ran despite failure during stop" "op-restart" "$(cat "$C2")"
+assert_eq "arm-before-stop: nothing was transferred" "" "$(grep push "$C2" || true)"
+ho_unstub
+
+# -- (D) exit-code preservation + single-fire: a failure AFTER the stop fires
+# -- recovery exactly once and preserves the code.
+C2="$TMP/c2_sf"; : > "$C2"
+ho_stubs
+stop_remote_claude() { echo stop >> "$C2"; }
+cmd_repo_pull() { return 7; }
+_recover_remote_op() { echo op >> "$C2"; printf RESTARTED; }
+rc=0; (cmd_handoff bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "recovery preserves the original exit code (7)" 7 "$rc"
+assert_eq "recovery fired exactly once (single-fire)" "1" "$(grep -c '^op$' "$C2")"
+ho_unstub
+
+# -- (E) restart half-success then probe OK does NOT type twice: the happy-path
+# -- send-keys returns nonzero but claude actually started; the trap re-checks,
+# -- sees RUNNING, and does not restart again.
+C2="$TMP/c2_half"; : > "$C2"
+ho_stubs
+stop_remote_claude() { echo stop >> "$C2"; }
+restart_remote_claude() { echo happy-restart >> "$C2"; return 1; }   # half-success
+_recover_remote_op() { echo probe >> "$C2"; printf RUNNING; }
+rc=0; out="$( (cmd_handoff bbb) 2>&1 )" || rc=$?
+assert_rc "half-success restart exits nonzero" 1 "$rc"
+assert_eq "happy-path restart attempted once" "1" "$(grep -c '^happy-restart$' "$C2")"
+assert_eq "recovery probed once" "1" "$(grep -c '^probe$' "$C2")"
+assert_match "recovery saw it already running (no second type)" "still running" "$out"
+ho_unstub
+
+# -- (F) handback pre-pull failure recovers the remote; no local-resume hint.
+HBF="$TMP/c2_hbf"; : > "$HBF"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/hbf.jsonl"; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$HBF"; }
+cmd_pull() { echo pull >> "$HBF"; return 9; }
+_recover_remote_op() { echo op-restart >> "$HBF"; printf RESTARTED; }
+NO_STOP=0; NO_EXTRAS=1; FORCE=0
+rc=0; out="$( (cmd_handback hbf) 2>&1 )" || rc=$?
+assert_rc "handback pull failure propagates (9)" 9 "$rc"
+assert_match "handback pull failure triggers recovery restart" "op-restart" "$(cat "$HBF")"
+case "$out" in *"resume locally"*) t_fail "no resume hint after a failed pull" "$out" ;; *) t_ok "no resume hint after a failed pull" ;; esac
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes stop_remote_claude cmd_pull _recover_remote_op
+
+# -- (G) --no-extras does NOT disable pull-window recovery (F ran with
+# -- NO_EXTRAS=1). And handback --no-stop performs NO recovery on pull failure.
+NSB="$TMP/c2_nsb"; : > "$NSB"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/nsb.jsonl"; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$NSB"; }
+cmd_pull() { echo pull >> "$NSB"; return 4; }
+_recover_remote_op() { echo op >> "$NSB"; printf RESTARTED; }
+NO_STOP=1; NO_EXTRAS=1; FORCE=0
+rc=0; (cmd_handback nsb) >/dev/null 2>&1 || rc=$?
+assert_rc "handback --no-stop pull failure propagates (4)" 4 "$rc"
+assert_eq "handback --no-stop never stops" "" "$(grep stop "$NSB" || true)"
+assert_eq "handback --no-stop performs NO recovery" "" "$(grep '^op$' "$NSB" || true)"
+unset -f require_remote find_remote_session compare_mtimes stop_remote_claude cmd_pull _recover_remote_op
+NO_STOP=0
+
+# -- (H) no restart after a SUCCESSFUL pull, even when extras hard-exits: the
+# -- trap is disarmed once the pull confirms local, so a later failure never
+# -- recreates a dual writer. (Mirrors the D2-belt cwd setup.)
+NRF="$TMP/c2_nrf"; : > "$NRF"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/nrf.jsonl"; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$NRF"; }
+cmd_pull() { echo pull >> "$NRF"; }
+remote_sh() { printf '/home/alice/code/my-app\n'; }   # cwd extractor for step 2b
+cmd_sync_extras() { echo extras >> "$NRF"; exit 5; }   # hard exit in the extras subshell
+_recover_remote_op() { echo op-restart >> "$NRF"; printf RESTARTED; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handback nrf) 2>&1 )" || rc=$?
+assert_rc "handback extras failure after a good pull returns extras rc (5)" 5 "$rc"
+assert_match "handback still prints the local-resume hint" "resume locally" "$out"
+assert_eq "NO recovery restart after a successful pull" "" "$(grep op-restart "$NRF" || true)"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes \
+  stop_remote_claude cmd_pull remote_sh cmd_sync_extras _recover_remote_op
+
+# -- (I) stop_remote_claude classifies its exit: 255 (disconnect) vs 1
+# -- (timeout) vs 2 (pgrep error) get distinct, accurate messages. Prior
+# -- blocks unset -f'd the real stop_remote_claude; re-source to restore it.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+export REMOTE=myhost
+remote_sh() { return 255; }
+rc=0; out="$( (stop_remote_claude sess %1) 2>&1 )" || rc=$?
+assert_rc "stop dies on ssh disconnect" 1 "$rc"
+assert_match "stop 255 -> disconnect/unknown message" "disconnected" "$out"
+remote_sh() { return 1; }
+out="$( (stop_remote_claude sess %1) 2>&1 )" || true
+assert_match "stop 1 -> timeout message" "did not exit after 10s" "$out"
+remote_sh() { return 2; }
+out="$( (stop_remote_claude sess %1) 2>&1 )" || true
+assert_match "stop 2 -> pgrep-error/unknown message" "pgrep errored" "$out"
+unset -f remote_sh; unset REMOTE
 
 t_summary

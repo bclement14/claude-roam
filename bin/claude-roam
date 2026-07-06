@@ -1279,47 +1279,135 @@ resolve_pane_or_refuse() {
 }
 
 # Stop the claude running in $pane and wait up to 10s for the pid to clear.
-# Does all polling in a single ssh to avoid 10 round-trips.
+# One remote_sh round trip does all the polling. Exit-status contract lets the
+# caller tell "confirmed stopped" from "could not verify":
+#   0    the process is confirmed gone
+#   1    still running after 10s (timeout)
+#   2    pgrep ERRORED on the remote  -> state UNKNOWN (never treated as gone)
+#   255  ssh disconnected mid-stop    -> state UNKNOWN
 stop_remote_claude() {
-  local sid="$1" pane="$2" sid_re
+  local sid="$1" pane="$2" sid_re rc
   # See sid_to_ere: escapes ERE-active `.` before it reaches pgrep's pattern.
   sid_re="$(sid_to_ere "$sid")"
   validate_pane "$pane"
-  if ssh "$REMOTE" "
-    tmux send-keys -t '$pane' C-c
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-      sleep 1
-      pgrep -f 'claude --resume[= ]${sid_re}( |\$)' >/dev/null 2>&1 || exit 0
-      if [ \"\$i\" = 5 ]; then
-        tmux send-keys -t '$pane' C-c
-      fi
-    done
-    exit 1
-  "; then
-    log "claude on remote stopped"
-  else
-    die "claude on remote did not exit after 10s; aborting handoff to avoid data loss"
-  fi
+  # Capture rc explicitly (see find_remote_pane): under `set -e` a failing
+  # remote_sh would exit before the case below could classify it.
+  set +e
+  remote_sh 'set -u
+pane=$1; sid_re=$2
+tmux send-keys -t "$pane" C-c 2>/dev/null
+i=0
+while [ "$i" -lt 10 ]; do
+  i=$((i+1))
+  sleep 1
+  pgrep -f "claude --resume[= ]${sid_re}( |\$)" >/dev/null 2>&1; prc=$?
+  [ "$prc" -eq 1 ] && exit 0
+  [ "$prc" -gt 1 ] && exit 2
+  [ "$i" -eq 5 ] && tmux send-keys -t "$pane" C-c 2>/dev/null
+done
+exit 1' "$pane" "$sid_re" >/dev/null 2>&1
+  rc=$?
+  set -e
+  case "$rc" in
+    0)   log "claude on remote stopped" ;;
+    2)   die "could not verify the remote claude stopped (pgrep errored on the remote); remote state is UNKNOWN — inspect it before retrying (nothing was transferred)" ;;
+    255) die "ssh to $REMOTE disconnected while stopping the remote claude; remote state is UNKNOWN — inspect it before retrying (nothing was transferred)" ;;
+    *)   die "claude on remote did not exit after 10s; aborting to avoid data loss (the remote is still running)" ;;
+  esac
 }
 
-# Restart claude in a pane (used by handoff success AND failure recovery).
+# Restart claude in a pane on the HAPPY path only (recovery uses the safe
+# re-checking path below). Simple send-keys; returns the remote/ssh status so
+# the caller can fall back to the armed recovery trap if it fails.
 restart_remote_claude() {
   local sid="$1" pane="$2"
   validate_pane "$pane"
-  ssh "$REMOTE" "tmux send-keys -t '$pane' 'claude --resume $sid' Enter"
+  remote_sh 'set -u
+tmux send-keys -t "$1" "claude --resume $2" Enter' "$pane" "$sid" >/dev/null 2>&1
 }
 
-HANDOFF_PANE=""; HANDOFF_SID=""
-_handoff_recover() {
+# ---- recovery: shared by handoff and handback ----
+# When PANE is non-empty a recovery trap is armed. PHASE is 'stopping' (a
+# failure here may pre-date a confirmed stop) or 'stopped-confirmed' (the stop
+# returned success). All three globals are cleared on disarm.
+ROAM_RECOVER_PANE=""; ROAM_RECOVER_SID=""; ROAM_RECOVER_PHASE=""
+
+_roam_recover_disarm() {
+  trap - EXIT
+  ROAM_RECOVER_PANE=""; ROAM_RECOVER_SID=""; ROAM_RECOVER_PHASE=""
+}
+
+_recover_manual_hint() {  # $1=sid $2=pane
+  log "  manual recovery: ssh $REMOTE \"tmux send-keys -t '$2' 'claude --resume $1' Enter\""
+}
+
+# ONE remote operation (H4): re-check for a live matching process AND, only if
+# there is none, restart in the stored pane — the recheck happens immediately
+# before send-keys, in a single ssh round trip, so the probe/restart window is
+# as narrow as possible. Prints one status word; a nonzero return is an
+# ssh/transport failure. Residual limit: a fully external concurrent start
+# between the recheck and the send-keys cannot be made atomic without a lock.
+_recover_remote_op() {  # $1=sid $2=pane -> RESTARTED|RUNNING|NOPANEID|SENDFAIL|NOTOOLS|ERROR <rc>
+  local sid="$1" pane="$2" sid_re
+  sid_re="$(sid_to_ere "$sid")"
+  remote_sh 'set -u
+pane=$1; sid_re=$2; sidlit=$3
+command -v pgrep >/dev/null 2>&1 || { echo NOTOOLS; exit 0; }
+pgrep -f "claude --resume[= ]${sid_re}( |\$)" >/dev/null 2>&1; prc=$?
+[ "$prc" -eq 0 ] && { echo RUNNING; exit 0; }
+[ "$prc" -gt 1 ] && { echo "ERROR $prc"; exit 0; }
+command -v tmux >/dev/null 2>&1 || { echo NOTOOLS; exit 0; }
+tmux list-panes -a -F "#{pane_id}" 2>/dev/null | grep -qx "$pane" || { echo NOPANEID; exit 0; }
+tmux send-keys -t "$pane" "claude --resume $sidlit" Enter 2>/dev/null && echo RESTARTED || echo SENDFAIL
+exit 0' "$pane" "$sid_re" "$sid"
+}
+
+# Decision + logging around the op (the H1 recovery matrix). Restarts ONLY when
+# the remote positively confirms no matching process is running. RUNNING /
+# ERROR / NOTOOLS / a missing pane / ssh failure all mean a writer may still be
+# alive, so those print a manual hint and never type into the pane.
+_recover_restart() {  # $1=sid $2=pane
+  local sid="$1" pane="$2" out rc
+  validate_pane "$pane"
+  set +e
+  out="$(_recover_remote_op "$sid" "$pane")"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    log "  could not reach $REMOTE to check/restart the session (ssh exit $rc); NOT restarting blindly."
+    _recover_manual_hint "$sid" "$pane"
+    return 0
+  fi
+  case "$out" in
+    RESTARTED) log "  remote claude was not running; restarted it in $pane." ;;
+    RUNNING)   log "  remote claude is still running in $pane; leaving it as-is (no restart needed)." ;;
+    NOPANEID)  log "  the target pane $pane no longer exists; NOT restarting."
+               _recover_manual_hint "$sid" "$pane" ;;
+    NOTOOLS)   log "  a required remote tool is missing; cannot verify state, so NOT restarting."
+               _recover_manual_hint "$sid" "$pane" ;;
+    SENDFAIL)  log "  tmux send-keys failed; restart NOT confirmed."
+               _recover_manual_hint "$sid" "$pane" ;;
+    "ERROR "*) log "  could not verify remote state (${out}); NOT restarting to avoid a second writer."
+               _recover_manual_hint "$sid" "$pane" ;;
+    *)         log "  unexpected recovery result ('${out}'); NOT restarting."
+               _recover_manual_hint "$sid" "$pane" ;;
+  esac
+  return 0
+}
+
+# EXIT-trap handler: single-fire, preserves the original exit code. M1: the
+# FIRST statement MUST capture $?; only THEN may `trap - EXIT` run (it resets
+# $? to 0). Do NOT log / assign / probe before the capture.
+_remote_recover() {
   local rc=$?
   trap - EXIT
-  if [ "$rc" -ne 0 ] && [ -n "$HANDOFF_PANE" ]; then
-    log "handoff FAILED (exit $rc) after the remote claude was stopped — attempting restart..."
-    if ! restart_remote_claude "$HANDOFF_SID" "$HANDOFF_PANE"; then
-      log "automatic restart failed. Manual recovery:"
-      log "  ssh $REMOTE \"tmux send-keys -t '$HANDOFF_PANE' 'claude --resume $HANDOFF_SID' Enter\""
-    fi
+  local pane="$ROAM_RECOVER_PANE" sid="$ROAM_RECOVER_SID" phase="$ROAM_RECOVER_PHASE"
+  ROAM_RECOVER_PANE=""; ROAM_RECOVER_SID=""; ROAM_RECOVER_PHASE=""
+  if [ "$rc" -eq 0 ] || [ -z "$pane" ]; then
+    exit "$rc"
   fi
+  log "operation FAILED (exit $rc) with the remote claude stopped (phase: $phase) — checking whether it needs restarting..."
+  _recover_restart "$sid" "$pane"
   exit "$rc"
 }
 
@@ -1375,12 +1463,16 @@ cmd_handoff() {
     fi
   fi
 
-  # 3. Stop the remote writer; from here on, any failure must restart it.
+  # 3. Stop the remote writer. ARM recovery BEFORE the stop: a failure DURING
+  #    the stop (Ctrl-C sent, then ssh drops or the poll times out, or
+  #    stop_remote_claude die()s) must still reach the recovery trap. The phase
+  #    flips to stopped-confirmed only once the stop returns success.
   if [ -n "$pane" ]; then
+    ROAM_RECOVER_PANE="$pane"; ROAM_RECOVER_SID="$sid"; ROAM_RECOVER_PHASE="stopping"
+    trap _remote_recover EXIT
     log "stopping claude in $pane..."
     stop_remote_claude "$sid" "$pane"
-    HANDOFF_PANE="$pane"; HANDOFF_SID="$sid"
-    trap _handoff_recover EXIT
+    ROAM_RECOVER_PHASE="stopped-confirmed"
   fi
 
   # 4. Transfer. The remote may have written shutdown records while exiting,
@@ -1395,21 +1487,20 @@ cmd_handoff() {
     cmd_sync_extras "$sid" to-remote || return $?
   fi
 
-  # 6. Restart FIRST, only disarm the trap once it succeeds. If the restart
-  # itself fails, the EXIT trap is still armed: exiting nonzero here fires
-  # _handoff_recover (one more automatic retry), and we also print the same
-  # manual-recovery hint directly so it's visible even if that retry works
-  # or the caller isn't watching for the trap's own message.
+  # 6. Restart FIRST, disarm only once it succeeds. If the restart's send-keys
+  # returns nonzero (e.g. ssh dropped after the keys landed), the trap stays
+  # armed: exiting nonzero fires _remote_recover, which RE-CHECKS before typing
+  # again — so a half-successful send never double-starts. We also print the
+  # manual hint directly for visibility.
   if [ -n "$pane" ]; then
     log "resuming session in $pane..."
     if restart_remote_claude "$sid" "$pane"; then
-      trap - EXIT
-      HANDOFF_PANE=""
-      log "handoff complete. attach with:"
-      log "  ssh $REMOTE -t tmux attach -t '${pane%%:*}'"
+      _roam_recover_disarm
+      log "handoff complete. the session is running again in pane $pane on $REMOTE."
+      log "  attach with: ssh $REMOTE -t tmux attach -t '$pane'"
     else
-      log "restart failed. Manual recovery:"
-      log "  ssh $REMOTE \"tmux send-keys -t '$pane' 'claude --resume $sid' Enter\""
+      log "restart command failed."
+      _recover_manual_hint "$sid" "$pane"
       exit 1
     fi
   else
@@ -1487,16 +1578,31 @@ cmd_handback() {
     _preflight_validate_path "$hb_rcwd"
   fi
 
-  # 3. Stop the remote writer — pulling while it writes tears the copy.
+  # 3. Stop the remote writer — pulling while it writes tears the copy. ARM
+  #    recovery BEFORE the stop (mirrors handoff): a failure during the stop or
+  #    the pull must be able to restart the remote, because control has NOT yet
+  #    moved local. The phase flips to stopped-confirmed once the stop returns.
   if [ -n "$pane" ]; then
+    ROAM_RECOVER_PANE="$pane"; ROAM_RECOVER_SID="$sid"; ROAM_RECOVER_PHASE="stopping"
+    trap _remote_recover EXIT
     log "stopping remote claude in $pane before pulling..."
     stop_remote_claude "$sid" "$pane"
+    ROAM_RECOVER_PHASE="stopped-confirmed"
   fi
 
   # 4. Pull. The remote may have written shutdown records while exiting
   # (making it look newer), so the inner pull runs forced — the preflight
-  # above already adjudicated.
-  FORCE=1 cmd_pull "$sid"
+  # above already adjudicated. Propagate a pull failure explicitly (|| return)
+  # so the armed trap fires: a nonzero pull leaves the local copy UNCONFIRMED
+  # (rsync writes a temp file and renames only on success), so the remote is
+  # still authoritative and MUST be restarted.
+  FORCE=1 cmd_pull "$sid" || return $?
+  # The pull SUCCEEDED: the authoritative copy is now local. Disarm BEFORE
+  # extras — from here a failure must NOT restart the remote (that would
+  # recreate a dual writer for a session whose control has moved local).
+  if [ -n "$pane" ]; then
+    _roam_recover_disarm
+  fi
   if [ "$NO_EXTRAS" -ne 1 ]; then
     # Pass the pre-validated cwds forward (both guaranteed non-empty: the
     # preflight above refused outside-$HOME cwds, so extras never re-parse
