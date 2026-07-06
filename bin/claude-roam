@@ -1041,7 +1041,10 @@ union_projects() {
 "
       fi
     done
-    rlist="$(remote_sh 'root="$1"; for p in "$2/$root"/*/; do [ -d "${p}.claude" ] && printf "%s\n" "${p#"$2"/}"; done 2>/dev/null' \
+    # `if`, not `[ -d ] &&`: the for-loop's exit status is its last command's,
+    # so a trailing project dir without .claude would read as a discovery
+    # failure and spuriously fail the sweep.
+    rlist="$(remote_sh 'root="$1"; for p in "$2/$root"/*/; do if [ -d "${p}.claude" ]; then printf "%s\n" "${p#"$2"/}"; fi; done 2>/dev/null' \
       "$root" "$RHOME")" || rc=1
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue

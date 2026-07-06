@@ -224,6 +224,16 @@ sync_try false || true
 assert_eq "sync_try counts failure" "1" "$FAILED_N"
 unset -f remote_sh require_remote
 
+# union_projects: a trailing project dir WITHOUT .claude must not flip the
+# remote discovery exit status (a for-loop's status is its last command's).
+# Execute the real remote script through bash, exactly as remote_sh does.
+remote_sh() { local script="$1"; shift; printf '%s' "$script" | bash -s -- "$@"; }
+mkdir -p "$TMP/rhome/code/aproj/.claude" "$TMP/rhome/code/zzz-no-claude"
+rc=0; out="$( ( PROJECT_ROOTS=(code); RHOME="$TMP/rhome"; union_projects ) )" || rc=$?
+assert_rc "union_projects: trailing no-.claude dir keeps rc=0" 0 "$rc"
+assert_match "union_projects: still lists the remote project" "code/aproj" "$out"
+unset -f remote_sh
+
 # ---- Task 2: skeleton ----
 assert_eq "encode_path root-strip" "-Users-alice" "$(encode_path /Users/alice)"
 assert_eq "encode_path nested" "-home-alice-code-proj" "$(encode_path /home/alice/code/proj)"
