@@ -1192,4 +1192,51 @@ esac
 unset -f remote_sh require_remote
 REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
 
+# ---- doctor: remote claude probed on the LOGIN-shell PATH ----
+# The tmux-pane restart ("claude --resume" typed into the pane) resolves
+# claude via the user's LOGIN/INTERACTIVE shell, whose PATH includes user
+# toolchains (mise, ~/.local/bin). The bare non-interactive ssh PATH does
+# NOT -- probing it false-alarmed "remote claude missing" on working setups.
+# Re-source to restore the genuine cmd_doctor/remote_sh after the unset -f
+# above, then stub remote_sh (same approach as the Task 12/M6a doctor tests).
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE="stubhost"
+
+# 1. script-content: the claude probe must run through a login+interactive
+# shell (bash -lic) with stdin closed so the interactive shell cannot hang.
+DRC_SCRIPT="$TMP/drc_script"; : > "$DRC_SCRIPT"
+remote_sh() { printf '%s' "$1" > "$DRC_SCRIPT"; }
+rc=0; (cmd_doctor) >/dev/null 2>&1 || rc=$?
+assert_rc "doctor claude probe: doctor exits 0 with an empty remote report" 0 "$rc"
+assert_match "doctor claude probe: runs via a login+interactive shell" 'bash -lic "command -v claude' "$(cat "$DRC_SCRIPT")"
+assert_match "doctor claude probe: closes stdin so bash -i cannot hang" '</dev/null' "$(cat "$DRC_SCRIPT")"
+
+# 2. claude absent from the login-shell PATH -> WARN only: doctor must
+# still exit 0 (warn lines never increment DOCTOR_FAILS) and surface it.
+remote_sh() { printf '%s\n' \
+  'ok   remote rsync present' \
+  'warn remote claude not found on the login-shell PATH — handoff restarts the session by typing claude --resume into the tmux pane, so claude must be on your interactive shell PATH (e.g. mise or ~/.local/bin)'; }
+rc=0; out="$(cmd_doctor 2>&1)" || rc=$?
+assert_rc "doctor claude probe: login-PATH warn does not fail doctor" 0 "$rc"
+assert_match "doctor claude probe: surfaces the login-PATH warn" "warn remote claude not found on the login-shell PATH" "$out"
+assert_match "doctor claude probe: warn points at the interactive-shell PATH fix" "interactive shell PATH" "$out"
+assert_match "doctor claude probe: doctor still reports overall success" "all checks passed" "$out"
+
+# 3. claude present on the login-shell PATH -> ok line, no warn.
+remote_sh() { printf '%s\n' \
+  'ok   remote claude present (on the login-shell PATH)'; }
+rc=0; out="$(cmd_doctor 2>&1)" || rc=$?
+assert_rc "doctor claude probe: exits 0 when claude is on the login-shell PATH" 0 "$rc"
+assert_match "doctor claude probe: surfaces the login-shell ok line" "ok   remote claude present (on the login-shell PATH)" "$out"
+case "$out" in
+  *"not found on the login-shell PATH"*)
+    t_fail "doctor claude probe: no warn when claude is on the login-shell PATH" "output: $out" ;;
+  *) t_ok "doctor claude probe: no warn when claude is on the login-shell PATH" ;;
+esac
+unset -f remote_sh require_remote
+REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
+
 t_summary

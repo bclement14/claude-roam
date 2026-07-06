@@ -1502,7 +1502,16 @@ if command -v tmux >/dev/null 2>&1; then echo "ok   remote tmux present"; else e
 for t in pgrep ps awk; do
   if command -v "$t" >/dev/null 2>&1; then echo "ok   remote $t present"; else echo "warn remote $t missing — handoff cannot locate/stop the remote session without it"; fi
 done
-if command -v claude >/dev/null 2>&1; then echo "ok   remote claude present"; else echo "warn remote claude missing — handoff cannot restart the session on the remote without it"; fi
+# handoff restarts claude by typing "claude --resume" into the tmux pane,
+# where the LOGIN/INTERACTIVE shell resolves it — so probe THAT PATH, not
+# this bare non-interactive ssh PATH (which excludes mise / ~/.local/bin
+# and would false-alarm on a perfectly working install). </dev/null keeps
+# the interactive shell from hanging while it waits on stdin.
+if bash -lic "command -v claude >/dev/null 2>&1" </dev/null >/dev/null 2>&1; then
+  echo "ok   remote claude present (on the login-shell PATH)"
+else
+  echo "warn remote claude not found on the login-shell PATH — handoff restarts the session by typing claude --resume into the tmux pane, so claude must be on your interactive shell PATH (e.g. mise or ~/.local/bin)"
+fi
 if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
   echo "ok   remote jq or python3 present (JSONL cwd resolution)"
 else
