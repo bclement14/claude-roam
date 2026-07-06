@@ -1305,6 +1305,12 @@ resolve_pane_or_refuse() {
 }
 
 # Stop the claude running in $pane and wait up to 10s for the pid to clear.
+# Claude Code's TUI quits only on a RAPID double Ctrl-C (two presses within
+# ~1s: "press again to exit", then exit); a single press -- or two presses
+# seconds apart -- each just re-arm that prompt and time out. So the pair is
+# sent back-to-back with no sleep between, and re-sent during the poll in
+# case the first pair was consumed interrupting an in-progress response
+# instead of reaching the quit prompt.
 # One remote_sh round trip does all the polling. Exit-status contract lets the
 # caller tell "confirmed stopped" from "could not verify":
 #   0    the process is confirmed gone
@@ -1322,6 +1328,7 @@ stop_remote_claude() {
   remote_sh 'set -u
 pane=$1; sid_re=$2
 tmux send-keys -t "$pane" C-c 2>/dev/null
+tmux send-keys -t "$pane" C-c 2>/dev/null
 i=0
 while [ "$i" -lt 10 ]; do
   i=$((i+1))
@@ -1329,7 +1336,10 @@ while [ "$i" -lt 10 ]; do
   pgrep -f "claude --resume[= ]${sid_re}( |\$)" >/dev/null 2>&1; prc=$?
   [ "$prc" -eq 1 ] && exit 0
   [ "$prc" -gt 1 ] && exit 2
-  [ "$i" -eq 5 ] && tmux send-keys -t "$pane" C-c 2>/dev/null
+  if [ "$i" -eq 3 ] || [ "$i" -eq 6 ]; then
+    tmux send-keys -t "$pane" C-c 2>/dev/null
+    tmux send-keys -t "$pane" C-c 2>/dev/null
+  fi
 done
 exit 1' "$pane" "$sid_re" >/dev/null 2>&1
   rc=$?

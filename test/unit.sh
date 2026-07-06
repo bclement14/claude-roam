@@ -1830,4 +1830,82 @@ unset -f _recover_remote_op
 unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG FAKE_PGREP_AFTER_SEND_RC
 unset -f remote_sh; unset REMOTE
 
+# ============================================================================
+# stop_remote_claude sends a RAPID double Ctrl-C (Claude Code quit sequence)
+# ============================================================================
+# Claude Code's TUI quits only on two Ctrl-C presses in quick succession;
+# presses seconds apart each just re-arm "press again to exit" and never quit.
+# Drive the REAL stop payload through `bash -s` on a restricted PATH whose
+# fakes append every tmux/sleep/pgrep event to ONE ordered sequence log, then
+# assert on the ORDER: the first pair must be back-to-back with no poll
+# between (the old code slept 5s before the second press and never stopped a
+# real Claude Code), re-sent in adjacent pairs during the poll, and the pgrep
+# rc-distinction (rc1 gone / rc>1 error / timeout) must survive unchanged.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+SEQ="$TMP/stopseq"
+export FAKE_SEQ_LOG="$SEQ"
+cat > "$TMP/fake_tmux" <<'FEOF'
+#!/bin/bash
+echo "tmux $*" >> "${FAKE_SEQ_LOG:-/dev/null}"
+exit 0
+FEOF
+cat > "$TMP/fake_sleep" <<'FEOF'
+#!/bin/bash
+echo "sleep $*" >> "${FAKE_SEQ_LOG:-/dev/null}"
+exit 0
+FEOF
+cat > "$TMP/fake_pgrep" <<'FEOF'
+#!/bin/bash
+echo "pgrep" >> "${FAKE_SEQ_LOG:-/dev/null}"
+exit "${FAKE_PGREP_RC:-0}"
+FEOF
+export REMOTE=stub
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
+PANEBIN="$(mk_panebin stopseq pgrep tmux sleep)"
+
+# pgrep rc 1 (process gone on the first poll) -> confirmed stopped, rc 0
+: > "$SEQ"; export FAKE_PGREP_RC=1
+rc=0; out="$( (stop_remote_claude sess %1) 2>&1 )" || rc=$?
+assert_rc "stop: pgrep rc1 -> confirmed stopped (rc 0)" 0 "$rc"
+assert_match "stop: rc1 logs stopped" "stopped" "$out"
+# the quit sequence: BOTH Ctrl-C's land before any sleep/poll (rapid pair) --
+# the old code slept between them, so event 2 was `sleep`, not a send
+assert_eq "stop: first two events are a back-to-back C-c pair (no sleep between)" \
+  "tmux send-keys -t %1 C-c
+tmux send-keys -t %1 C-c" "$(sed -n '1,2p' "$SEQ")"
+assert_eq "stop: confirmed-on-first-poll sends exactly one pair" \
+  "2" "$(grep -c '^tmux send-keys' "$SEQ")"
+
+# pgrep rc >1 (errored) -> exit 2 path: state UNKNOWN, never treated as gone
+export FAKE_PGREP_RC=2
+rc=0; out="$( (stop_remote_claude sess %1) 2>&1 )" || rc=$?
+assert_rc "stop: pgrep rc2 -> dies (state UNKNOWN)" 1 "$rc"
+assert_match "stop: pgrep rc2 -> pgrep-errored message" "pgrep errored" "$out"
+
+# pgrep rc 0 throughout (never exits) -> timeout path, with the rapid pair
+# RE-SENT during the poll (a mid-response claude eats the first pair)
+: > "$SEQ"; export FAKE_PGREP_RC=0
+rc=0; out="$( (stop_remote_claude sess %1) 2>&1 )" || rc=$?
+assert_rc "stop: still running after 10s -> dies" 1 "$rc"
+assert_match "stop: timeout message" "did not exit after 10s" "$out"
+assert_eq "stop: timeout run re-sends the pair during the poll (3 pairs total)" \
+  "6" "$(grep -c '^tmux send-keys' "$SEQ")"
+# every C-c must be half of an ADJACENT pair: consecutive log lines, no
+# sleep/pgrep between the two presses (else Claude Code never sees a double)
+pairs_ok=yes; prev=""
+while read -r n; do
+  if [ -z "$prev" ]; then prev="$n"
+  else
+    [ "$n" -eq $((prev+1)) ] || pairs_ok=no
+    prev=""
+  fi
+done <<EOF
+$(grep -n '^tmux send-keys' "$SEQ" | cut -d: -f1)
+EOF
+if [ -n "$prev" ]; then pairs_ok=no; fi
+assert_eq "stop: every re-sent C-c is back-to-back with its pair" "yes" "$pairs_ok"
+unset FAKE_PGREP_RC FAKE_SEQ_LOG
+unset -f remote_sh; unset REMOTE
+
 t_summary
