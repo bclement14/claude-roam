@@ -1462,13 +1462,31 @@ case "${1:-}" in
   *) exit 0 ;;
 esac
 FEOF
+# RESTARTED is now VERIFIED (H5 commit 3): the op polls for the matching
+# process AFTER the send. The fake pgrep models a claude that starts once the
+# keys land: when FAKE_PGREP_AFTER_SEND_RC is set AND the send log is
+# non-empty, it reports that rc instead of FAKE_PGREP_RC. With it unset the
+# fake behaves exactly as before. The instant fake sleep keeps the poll fast.
+cat > "$TMP/fake_pgrep" <<'FEOF'
+#!/bin/bash
+if [ -n "${FAKE_PGREP_AFTER_SEND_RC:-}" ] && [ -s "${FAKE_SEND_LOG:-/dev/null}" ]; then
+  exit "$FAKE_PGREP_AFTER_SEND_RC"
+fi
+[ -n "${FAKE_PGREP_OUT:-}" ] && printf '%s\n' $FAKE_PGREP_OUT
+exit "${FAKE_PGREP_RC:-0}"
+FEOF
+cat > "$TMP/fake_sleep" <<'FEOF'
+#!/bin/bash
+exit 0
+FEOF
 export REMOTE=stub
 export FAKE_SEND_LOG="$TMP/sendlog"
 remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
-PANEBIN="$(mk_panebin recov pgrep ps tmux)"
+PANEBIN="$(mk_panebin recov pgrep ps tmux sleep)"
 
-# no match + pane present -> RESTARTED, exactly one send-keys
+# no match + pane present -> send, process appears -> RESTARTED, one send-keys
 : > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%1"
+export FAKE_PGREP_AFTER_SEND_RC=0
 assert_eq "op: no match + pane -> RESTARTED" "RESTARTED" "$(_recover_remote_op sess %1)"
 assert_eq "op: RESTARTED typed exactly once" "1" "$(grep -c '^send' "$FAKE_SEND_LOG")"
 
@@ -1489,7 +1507,7 @@ export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%2"
 : > "$FAKE_SEND_LOG"
 assert_eq "op: missing pane id -> NOPANEID" "NOPANEID" "$(_recover_remote_op sess %1)"
 assert_eq "op: NOPANEID never types" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
-unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG
+unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG FAKE_PGREP_AFTER_SEND_RC
 unset -f remote_sh; unset REMOTE
 
 # -- (C) arm-before-stop (FM1): a failure DURING the stop (before any transfer)
@@ -1627,6 +1645,138 @@ assert_match "recover(no-grep): cannot-verify message" "cannot verify" "$out"
 assert_match "recover(no-grep): manual hint" "manual recovery" "$out"
 assert_eq "recover(no-grep): never types into the pane" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
 unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG
+unset -f remote_sh; unset REMOTE
+
+# ============================================================================
+# H5 commit 3: mixed pane topology fails closed; restarts are VERIFIED
+# ============================================================================
+# Prior blocks unset -f'd real functions; re-source to restore the genuine
+# implementations before layering the protocol harness on top.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+SDIR="$PROJECTS/$(encode_path "$HOME")-code-p1"
+export REMOTE=stub
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
+
+# -- (J) FIX 1 at the protocol level: a matching PID that maps to a pane
+# -- alongside a matching PID that walks to PID 1 WITHOUT mapping (a stale
+# -- tmux-argv match, or a matching process outside tmux) must fail closed as
+# -- AMBIGUOUS, never OK: stopping the mapped pane would leave the unmapped
+# -- matching writer running. Upgraded fake ps: per-pid rc via FAKE_PS_RC_<pid>
+# -- so one pid can vanish (rc 1) while the others keep resolving.
+cat > "$TMP/fake_ps" <<'FEOF'
+#!/bin/bash
+[ "${FAKE_PS_RC:-0}" != 0 ] && exit "$FAKE_PS_RC"
+pid=""
+while [ $# -gt 0 ]; do case "$1" in -p) pid="$2"; shift 2 ;; *) shift ;; esac; done
+eval "prc=\${FAKE_PS_RC_$pid:-0}"
+[ "$prc" != 0 ] && exit "$prc"
+eval "v=\${FAKE_PPID_$pid:-}"
+[ -n "$v" ] && printf '   %s\n' "$v"
+exit 0
+FEOF
+PANEBIN="$(mk_panebin mixed pgrep ps tmux)"
+# pid 1000 maps to pane %3 (via wrapper 900); pid 5000 walks to PID 1 unmapped.
+export FAKE_PGREP_RC=0 FAKE_PGREP_OUT="1000 5000"
+export FAKE_PPID_1000=900 FAKE_PPID_900=1 FAKE_PPID_5000=1
+export FAKE_PANES="900 %3"
+assert_eq "protocol: mapped + unmapped match -> AMBIGUOUS (fail closed)" \
+  "AMBIGUOUS %3" "$(find_remote_pane s1)"
+# the single-session wrapper+child shape must still dedup to one clean OK
+export FAKE_PGREP_OUT="1000 1001" FAKE_PPID_1001=900
+assert_eq "protocol: wrapper+child both map -> still OK %3" "OK %3" "$(find_remote_pane s1)"
+
+# -- (K) FIX 1b: a matched pid VANISHING mid-walk (ps -p rc 1: it exited
+# -- between pgrep and the walk) is not a tool failure — it is an unmapped
+# -- match, so alongside a mapped one the answer is AMBIGUOUS, never ERROR ps.
+export FAKE_PGREP_OUT="1000 6000" FAKE_PS_RC_6000=1
+assert_eq "protocol: vanished pid + mapped pid -> AMBIGUOUS (not ERROR ps)" \
+  "AMBIGUOUS %3" "$(find_remote_pane s1)"
+# a REAL ps failure (rc > 1) still fails closed as ERROR ps
+export FAKE_PS_RC_6000=2
+assert_eq "protocol: ps rc 2 stays ERROR ps 2" "ERROR ps 2" "$(find_remote_pane s1)"
+unset FAKE_PS_RC_6000 FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES
+unset FAKE_PPID_1000 FAKE_PPID_1001 FAKE_PPID_900 FAKE_PPID_5000
+
+# -- (L) FIX 2 at the op level: RESTARTED must be VERIFIED. Keys delivered
+# -- (send-keys rc 0) but no matching process appearing within the poll budget
+# -- -> NOTSTARTED, never RESTARTED. Uses the send-log-aware fake pgrep and the
+# -- instant fake sleep from the block above.
+export FAKE_SEND_LOG="$TMP/sendlog3"
+PANEBIN="$(mk_panebin verify pgrep ps tmux sleep)"
+unset FAKE_PGREP_AFTER_SEND_RC
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%1"
+assert_eq "op: send ok but claude never appears -> NOTSTARTED" \
+  "NOTSTARTED" "$(_recover_remote_op sess %1)"
+assert_eq "op: unconfirmed restart still typed exactly once" "1" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+# decision layer on the REAL op: NOTSTARTED prints could-not-confirm + the
+# manual hint and never logs a successful restart.
+: > "$FAKE_SEND_LOG"
+out="$(_recover_restart sess %1 2>&1)"
+assert_match "recover(NOTSTARTED): could-not-confirm message" "could not confirm" "$out"
+assert_match "recover(NOTSTARTED): manual hint" "manual recovery" "$out"
+case "$out" in
+  *"restarted it"*) t_fail "recover(NOTSTARTED): must not log a successful restart" "$out" ;;
+  *) t_ok "recover(NOTSTARTED): no success log" ;;
+esac
+# gone before the send, present after it -> a CONFIRMED RESTARTED
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_AFTER_SEND_RC=0
+assert_eq "op: claude appears after send -> RESTARTED" "RESTARTED" "$(_recover_remote_op sess %1)"
+
+# -- (M) FIX 2 happy path: restart_remote_claude returns 0 ONLY when the
+# -- post-send poll finds the process, nonzero when it never appears.
+: > "$FAKE_SEND_LOG"; unset FAKE_PGREP_AFTER_SEND_RC
+rc=0; restart_remote_claude sess %1 || rc=$?
+assert_rc "restart_remote_claude: unconfirmed -> nonzero" 1 "$rc"
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_AFTER_SEND_RC=0
+rc=0; restart_remote_claude sess %1 || rc=$?
+assert_rc "restart_remote_claude: confirmed -> 0" 0 "$rc"
+
+# -- (N) FIX 2 end-to-end: an unconfirmed restart must NOT produce "handoff
+# -- complete" -- it exits nonzero with the armed trap / manual hint engaged.
+C3="$TMP/c3_ho"; : > "$C3"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'local-newer'; }
+stop_remote_claude() { echo stop >> "$C3"; }
+cmd_push() { echo push >> "$C3"; }
+cmd_repo_pull() { echo repopull >> "$C3"; }
+cmd_sync_extras() { echo extras >> "$C3"; }
+session_cwd_local() { printf '%s' "$HOME/code/p1"; }
+: > "$FAKE_SEND_LOG"; unset FAKE_PGREP_AFTER_SEND_RC
+export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%1"
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handoff bbb) 2>&1 )" || rc=$?
+assert_rc "handoff: unconfirmed restart exits nonzero" 1 "$rc"
+case "$out" in
+  *"handoff complete"*) t_fail "handoff: unconfirmed restart must not claim completion" "$out" ;;
+  *) t_ok "handoff: unconfirmed restart never claims completion" ;;
+esac
+assert_match "handoff: unconfirmed restart says could-not-confirm" "could not confirm" "$out"
+assert_match "handoff: unconfirmed restart prints the manual hint" "manual recovery" "$out"
+unset -f require_remote find_local_session find_remote_pane compare_mtimes \
+  stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras session_cwd_local
+
+# -- (O) FIX 3: the recovery banner is phase-sensitive. A failure while
+# -- STOPPING never claims the remote is stopped (the stop was unconfirmed);
+# -- only stopped-confirmed may say so.
+_recover_remote_op() { printf RUNNING; }
+rc=0; out="$( ( ROAM_RECOVER_PANE=%1; ROAM_RECOVER_SID=sess; ROAM_RECOVER_PHASE=stopping
+  false; _remote_recover ) 2>&1 )" || rc=$?
+assert_rc "recover banner (stopping): preserves the exit code" 1 "$rc"
+assert_match "recover banner (stopping): remote state unknown" "remote state unknown" "$out"
+assert_match "recover banner (stopping): names the stopping failure" "while stopping" "$out"
+out2="$( ( ROAM_RECOVER_PANE=%1; ROAM_RECOVER_SID=sess; ROAM_RECOVER_PHASE=stopped-confirmed
+  false; _remote_recover ) 2>&1 )" || true
+assert_match "recover banner (stopped-confirmed): says it was stopped" "the remote claude was stopped" "$out2"
+case "$out2" in
+  *"remote state unknown"*) t_fail "recover banner: phases must differ" "$out2" ;;
+  *) t_ok "recover banner: phases differ" ;;
+esac
+unset -f _recover_remote_op
+unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG FAKE_PGREP_AFTER_SEND_RC
 unset -f remote_sh; unset REMOTE
 
 t_summary

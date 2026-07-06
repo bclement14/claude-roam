@@ -1166,7 +1166,10 @@ EOF
 # remote state is uncertain. stdout is exactly one of:
 #   OK <pane_id>        exactly one tmux pane runs this session (pane_id = %<n>)
 #   NOPANE              tools present, no matching process is running
-#   AMBIGUOUS <ids...>  more than one distinct pane matches -> caller refuses
+#   AMBIGUOUS <ids...>  more than one distinct pane matches, OR the topology is
+#                       MIXED (some matches mapped to a pane, some did not) ->
+#                       caller refuses: a pane-targeted stop could leave an
+#                       unmapped matching writer running
 #   NOTMUX              matching process(es) exist but none live in a tmux pane
 #   NOTOOLS <tools...>  a required remote tool is missing -> state unverifiable
 #   ERROR <stage> <rc>  a present tool FAILED at runtime  -> state unverifiable
@@ -1201,10 +1204,14 @@ for t in ps tmux tr; do command -v "$t" >/dev/null 2>&1 || miss="$miss $t"; done
 # 4. Snapshot the pane table once (pane_pid pane_id); fail closed on error.
 panes=$(tmux list-panes -a -F "#{pane_pid} #{pane_id}" 2>/dev/null); trc=$?
 [ "$trc" -ne 0 ] && { echo "ERROR tmux $trc"; exit 0; }
-# 5. Walk each match up its ancestry to a pane_pid; collect DISTINCT pane ids.
-found=""
+# 5. Walk each match up its ancestry to a pane_pid; collect DISTINCT pane ids
+#    AND track whether EVERY match mapped to one. A match that walks to PID 1
+#    or exhausts the hop limit is UNMAPPED, not ignorable. A pid that vanishes
+#    mid-walk (ps rc 1, or an empty ppid: it exited between pgrep and here) is
+#    also UNMAPPED; only ps rc > 1 is a real tool failure -> ERROR.
+found=""; unmapped=0
 for pid in $pids; do
-  cur=$pid; hops=0
+  cur=$pid; hops=0; mapped=0
   while [ -n "$cur" ] && [ "$cur" -gt 1 ] 2>/dev/null; do
     hit=""; oldifs=$IFS; IFS="
 "
@@ -1213,19 +1220,28 @@ for pid in $pids; do
     done
     IFS=$oldifs
     if [ -n "$hit" ]; then
+      mapped=1
       case " $found " in *" $hit "*) : ;; *) found="$found $hit" ;; esac
       break
     fi
     parent=$(ps -o ppid= -p "$cur" 2>/dev/null); prc2=$?
-    [ "$prc2" -ne 0 ] && { echo "ERROR ps $prc2"; exit 0; }
+    [ "$prc2" -eq 1 ] && break
+    [ "$prc2" -gt 1 ] && { echo "ERROR ps $prc2"; exit 0; }
     cur=$(printf "%s" "$parent" | tr -d "[:space:]")
     hops=$((hops+1)); [ "$hops" -gt 64 ] && break
   done
+  [ "$mapped" -eq 0 ] && unmapped=1
 done
 found="${found# }"
 [ -z "$found" ] && { echo NOTMUX; exit 0; }
+# 6. MIXED topology fails closed: if ANY match did not map to a pane, a single
+#    mapped pane must NOT be reported OK -- stopping that pane would leave the
+#    unmapped matching writer running. Reuse AMBIGUOUS (callers already refuse
+#    on it before any stop).
 set -- $found
-if [ "$#" -eq 1 ]; then echo "OK $1"; else echo "AMBIGUOUS $found"; fi
+if [ "$unmapped" -eq 1 ]; then echo "AMBIGUOUS $found"
+elif [ "$#" -eq 1 ]; then echo "OK $1"
+else echo "AMBIGUOUS $found"; fi
 exit 0' "$sid_re")
   rc=$?
   set -e
@@ -1317,13 +1333,30 @@ exit 1' "$pane" "$sid_re" >/dev/null 2>&1
 }
 
 # Restart claude in a pane on the HAPPY path only (recovery uses the safe
-# re-checking path below). Simple send-keys; returns the remote/ssh status so
-# the caller can fall back to the armed recovery trap if it fails.
+# re-checking path below) -- and VERIFY it. send-keys rc 0 proves only that
+# the keys were DELIVERED, not that claude STARTED (claude not on the pane
+# shell's PATH, a shell error, keys typed before the shell was ready). After
+# the send, poll for a matching process in the SAME remote round trip (~8
+# tries, ~4s budget, early-exit on the first match). Returns 0 ONLY when the
+# restart is CONFIRMED; any other outcome (send failed, no process within the
+# budget, ssh drop) is nonzero so the caller falls back to the armed recovery
+# trap instead of reporting success. Bias: a slow start may misreport "not
+# confirmed" (safe -- recovery RE-CHECKS before ever typing again); a false
+# "restarted" must never happen.
 restart_remote_claude() {
-  local sid="$1" pane="$2"
+  local sid="$1" pane="$2" sid_re
+  sid_re="$(sid_to_ere "$sid")"
   validate_pane "$pane"
   remote_sh 'set -u
-tmux send-keys -t "$1" "claude --resume $2" Enter' "$pane" "$sid" >/dev/null 2>&1
+pane=$1; sidlit=$2; sid_re=$3
+tmux send-keys -t "$pane" "claude --resume $sidlit" Enter || exit 1
+i=0
+while [ "$i" -lt 8 ]; do
+  i=$((i+1))
+  sleep 0.5 2>/dev/null || sleep 1 2>/dev/null
+  pgrep -f "claude --resume[= ]${sid_re}( |\$)" >/dev/null 2>&1 && exit 0
+done
+exit 1' "$pane" "$sid" "$sid_re" >/dev/null 2>&1
 }
 
 # ---- recovery: shared by handoff and handback ----
@@ -1344,10 +1377,14 @@ _recover_manual_hint() {  # $1=sid $2=pane
 # ONE remote operation (H4): re-check for a live matching process AND, only if
 # there is none, restart in the stored pane — the recheck happens immediately
 # before send-keys, in a single ssh round trip, so the probe/restart window is
-# as narrow as possible. Prints one status word; a nonzero return is an
-# ssh/transport failure. Residual limit: a fully external concurrent start
-# between the recheck and the send-keys cannot be made atomic without a lock.
-_recover_remote_op() {  # $1=sid $2=pane -> RESTARTED|RUNNING|NOPANEID|SENDFAIL|NOTOOLS|ERROR <rc>
+# as narrow as possible. RESTARTED is VERIFIED, not assumed from send-keys rc:
+# after the send, the same round trip polls (~8 tries, ~4s budget) for the
+# matching process; no match within the budget -> NOTSTARTED (keys delivered
+# but the start was never confirmed). Prints one status word; a nonzero return
+# is an ssh/transport failure. Residual limit: a fully external concurrent
+# start between the recheck and the send-keys cannot be made atomic without a
+# lock.
+_recover_remote_op() {  # $1=sid $2=pane -> RESTARTED|RUNNING|NOPANEID|NOTSTARTED|SENDFAIL|NOTOOLS|ERROR <rc>
   local sid="$1" pane="$2" sid_re
   sid_re="$(sid_to_ere "$sid")"
   remote_sh 'set -u
@@ -1358,7 +1395,14 @@ pgrep -f "claude --resume[= ]${sid_re}( |\$)" >/dev/null 2>&1; prc=$?
 [ "$prc" -gt 1 ] && { echo "ERROR $prc"; exit 0; }
 for t in tmux grep; do command -v "$t" >/dev/null 2>&1 || { echo NOTOOLS; exit 0; }; done
 tmux list-panes -a -F "#{pane_id}" 2>/dev/null | grep -qx "$pane" || { echo NOPANEID; exit 0; }
-tmux send-keys -t "$pane" "claude --resume $sidlit" Enter 2>/dev/null && echo RESTARTED || echo SENDFAIL
+tmux send-keys -t "$pane" "claude --resume $sidlit" Enter 2>/dev/null || { echo SENDFAIL; exit 0; }
+i=0
+while [ "$i" -lt 8 ]; do
+  i=$((i+1))
+  sleep 0.5 2>/dev/null || sleep 1 2>/dev/null
+  pgrep -f "claude --resume[= ]${sid_re}( |\$)" >/dev/null 2>&1 && { echo RESTARTED; exit 0; }
+done
+echo NOTSTARTED
 exit 0' "$pane" "$sid_re" "$sid"
 }
 
@@ -1385,7 +1429,9 @@ _recover_restart() {  # $1=sid $2=pane
                _recover_manual_hint "$sid" "$pane" ;;
     NOTOOLS)   log "  a required remote tool is missing; cannot verify state, so NOT restarting."
                _recover_manual_hint "$sid" "$pane" ;;
-    SENDFAIL)  log "  tmux send-keys failed; restart NOT confirmed."
+    NOTSTARTED) log "  could not confirm claude restarted (keys were sent, but no matching process appeared) — check the pane."
+               _recover_manual_hint "$sid" "$pane" ;;
+    SENDFAIL)  log "  tmux send-keys failed; could not confirm claude restarted — check the pane."
                _recover_manual_hint "$sid" "$pane" ;;
     "ERROR "*) log "  could not verify remote state (${out}); NOT restarting to avoid a second writer."
                _recover_manual_hint "$sid" "$pane" ;;
@@ -1406,7 +1452,13 @@ _remote_recover() {
   if [ "$rc" -eq 0 ] || [ -z "$pane" ]; then
     exit "$rc"
   fi
-  log "operation FAILED (exit $rc) with the remote claude stopped (phase: $phase) — checking whether it needs restarting..."
+  # Phase-sensitive: in the 'stopping' phase the stop was never confirmed, so
+  # the remote may still be running -- do not claim it is stopped.
+  if [ "$phase" = "stopping" ]; then
+    log "operation FAILED (exit $rc); remote state unknown (a failure occurred while stopping) — checking whether the remote claude needs restarting..."
+  else
+    log "operation FAILED (exit $rc); the remote claude was stopped — checking whether it needs restarting..."
+  fi
   _recover_restart "$sid" "$pane"
   exit "$rc"
 }
@@ -1487,11 +1539,13 @@ cmd_handoff() {
     cmd_sync_extras "$sid" to-remote || return $?
   fi
 
-  # 6. Restart FIRST, disarm only once it succeeds. If the restart's send-keys
-  # returns nonzero (e.g. ssh dropped after the keys landed), the trap stays
-  # armed: exiting nonzero fires _remote_recover, which RE-CHECKS before typing
-  # again — so a half-successful send never double-starts. We also print the
-  # manual hint directly for visibility.
+  # 6. Restart FIRST, disarm ONLY on a CONFIRMED restart (the matching process
+  # was actually observed after the send — see restart_remote_claude). On any
+  # unconfirmed outcome (send failed, keys delivered but no process appeared,
+  # ssh dropped) the trap stays armed: exiting nonzero fires _remote_recover,
+  # which RE-CHECKS before typing again — so a half-successful send never
+  # double-starts, and an unstarted claude is never reported as "handoff
+  # complete". We also print the manual hint directly for visibility.
   if [ -n "$pane" ]; then
     log "resuming session in $pane..."
     if restart_remote_claude "$sid" "$pane"; then
@@ -1499,7 +1553,7 @@ cmd_handoff() {
       log "handoff complete. the session is running again in pane $pane on $REMOTE."
       log "  attach with: ssh $REMOTE -t tmux attach -t '$pane'"
     else
-      log "restart command failed."
+      log "could not confirm claude restarted — check the pane."
       _recover_manual_hint "$sid" "$pane"
       exit 1
     fi
