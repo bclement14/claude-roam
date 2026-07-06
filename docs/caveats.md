@@ -119,6 +119,23 @@ When no pane is found, `handoff`/`handback` still do everything else (push
 the JSONL, pull the repo, sync extras) — they just leave you to run
 `claude --resume <sid>` yourself instead of restarting it for you.
 
+## macOS remotes: stale tmux argv can make handoff refuse
+
+Pane discovery matches processes with `pgrep -f 'claude --resume <sid>'`.
+On a **macOS remote**, when a tmux session was created with an inline
+command (e.g. `tmux new-session -d 'claude --resume <sid>'`), the tmux
+server process itself can carry that command line in its argv — and on
+macOS it keeps matching the `pgrep -f` pattern even after the claude
+inside has exited. Discovery then sees a "match" that maps to no pane
+and reports `NOTMUX` (or the stop wait times out), so
+`handoff`/`handback` **refuse**. The refusal is fail-closed — nothing
+is stopped or restarted, so it is never unsafe — but it can decline a
+handoff that would actually have been fine. Linux remotes are
+unaffected. If you hit this on a macOS remote, clear the stale match
+first (kill the leftover tmux session or window that was created with
+the inline command), or stop the remote session yourself and re-run
+with `--no-stop`.
+
 ## Tool-call paths inside the JSONL are not rewritten
 
 The `$HOME`-prefix translation in [docs/internals.md](internals.md) only

@@ -242,7 +242,7 @@ case "$-" in *e*) t_fail "sourcing leaks set -e" "opts=$-" ;; *) t_ok "sourcing 
 CALLS="$TMP/calls"; : > "$CALLS"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { echo preflight >> "$CALLS"; printf '%s' "$STUB_CMP"; }
 stop_remote_claude() { echo stop >> "$CALLS"; }
 cmd_push() { echo push >> "$CALLS"; }
@@ -263,13 +263,17 @@ assert_rc "handoff succeeds local-newer" 0 "$rc"
 assert_eq "handoff order preflight,stop,push,repopull,extras,restart" \
   "preflight stop push repopull extras restart" "$(tr '\n' ' ' < "$CALLS" | sed 's/ *$//')"
 
-# trap recovery: failure after stop must still attempt restart
+# trap recovery: failure after stop must still attempt restart. Recovery now
+# goes through the safe re-check+restart op (_recover_remote_op); stub it to
+# report "no matching process -> restarted" so the trap's restart is observable.
 : > "$CALLS"; cmd_repo_pull() { echo repopull >> "$CALLS"; return 1; }
+_recover_remote_op() { echo restart >> "$CALLS"; printf RESTARTED; }
 rc=0; (cmd_handoff bbb) >/dev/null 2>&1 || rc=$?
 assert_rc "handoff propagates failure" 1 "$rc"
 assert_match "trap attempted restart after failure" "restart" "$(cat "$CALLS")"
 unset -f require_remote find_local_session find_remote_pane compare_mtimes \
-  stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras restart_remote_claude session_cwd_local
+  stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras restart_remote_claude \
+  session_cwd_local _recover_remote_op
 
 # ---- Task 12: doctor ----
 REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
@@ -296,7 +300,7 @@ REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
 STOPFILE="$TMP/handback_stop_calls"; : > "$STOPFILE"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-p1/bbb.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'local-newer'; }
 stop_remote_claude() { echo "stop $*" >> "$STOPFILE"; }
 cmd_pull() { echo "pull should not run" >> "$STOPFILE"; }
@@ -744,7 +748,7 @@ load_config   # restore extras arrays
 STOPF="$TMP/h6_hb_stop"; : > "$STOPF"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/h6r.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'remote-newer'; }
 stop_remote_claude() { echo stop >> "$STOPF"; }
 cmd_pull() { echo pull >> "$STOPF"; }
@@ -767,20 +771,22 @@ NO_EXTRAS=0
 CALLS2="$TMP/h6_ho"; : > "$CALLS2"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_local_session() { printf '%s' "$PROJECTS/$LHP-code-my-app/h6a.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'local-newer'; }
 session_cwd_local() { printf '%s' "$HOME/code/my-app"; }   # preflight resolves fine
 session_cwd_remote() { return 1; }                          # later read: unresolvable
 stop_remote_claude() { echo stop >> "$CALLS2"; }
 cmd_push() { echo push >> "$CALLS2"; }
 remote_sh() { :; }
-restart_remote_claude() { echo restart >> "$CALLS2"; }
+# Recovery now flows through the safe re-check+restart op; stub it to report a
+# clean restart so the trap's recovery action stays observable.
+_recover_remote_op() { echo restart >> "$CALLS2"; printf RESTARTED; }
 NO_EXTRAS=0; NO_STOP=0; FORCE=0
 rc=0; (cmd_handoff h6a) >/dev/null 2>&1 || rc=$?
 assert_rc "H6.22 handoff propagates a post-preflight resolver failure" 1 "$rc"
 assert_match "H6.22 handoff attempted restart after the failure" "restart" "$(cat "$CALLS2")"
 unset -f require_remote find_local_session find_remote_pane compare_mtimes \
-  session_cwd_local session_cwd_remote stop_remote_claude cmd_push remote_sh restart_remote_claude
+  session_cwd_local session_cwd_remote stop_remote_claude cmd_push remote_sh _recover_remote_op
 
 # ---- H6 audit fixes: D1 (jq/python3 required for cwd extraction), ----
 # ---- D2 (validate transfer paths BEFORE the remote stop),          ----
@@ -857,7 +863,7 @@ case "$out" in *code-my/app*) t_fail "D1 no-parser mode must not emit the phanto
 HB3STOP="$TMP/hb3_stop"; : > "$HB3STOP"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/hb3.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'remote-newer'; }
 stop_remote_claude() { echo stop >> "$HB3STOP"; }
 cmd_pull() { echo pull >> "$HB3STOP"; }
@@ -877,7 +883,7 @@ unset -f require_remote find_remote_session find_remote_pane compare_mtimes stop
 D2STOP="$TMP/d2hb_stop"; : > "$D2STOP"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my app/d2s.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'remote-newer'; }
 stop_remote_claude() { echo stop >> "$D2STOP"; }
 cmd_pull() { echo pull >> "$D2STOP"; }
@@ -892,7 +898,7 @@ NO_EXTRAS=0
 D2HOSTOP="$TMP/d2ho_stop"; : > "$D2HOSTOP"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_local_session() { printf '%s' "$PROJECTS/$LHP-code-my app/d2h.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'local-newer'; }
 session_cwd_local() { printf '%s/code/my app' "$HOME"; }
 stop_remote_claude() { echo stop >> "$D2HOSTOP"; }
@@ -913,7 +919,7 @@ unset -f require_remote find_local_session find_remote_pane compare_mtimes \
 HINTLOG="$TMP/d2hint_calls"; : > "$HINTLOG"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/hbe.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'remote-newer'; }
 stop_remote_claude() { echo stop >> "$HINTLOG"; }
 cmd_pull() { echo pull >> "$HINTLOG"; }
@@ -941,7 +947,7 @@ assert_eq "D3 resolver returns the collision candidate as-is" "/Users-alice/code
 D3STOP="$TMP/d3_stop"; : > "$D3STOP"
 require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
 find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-app/d3s.jsonl"; }
-find_remote_pane() { printf 'OK main:1.0'; }
+find_remote_pane() { printf '%s' 'OK %1'; }
 compare_mtimes() { printf 'remote-newer'; }
 stop_remote_claude() { echo stop >> "$D3STOP"; }
 cmd_pull() { echo pull >> "$D3STOP"; }
@@ -1238,5 +1244,389 @@ case "$out" in
 esac
 unset -f remote_sh require_remote
 REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
+# ============================================================================
+# H5/M6b commit 1: fail-closed find_remote_pane protocol + caller refusals
+# ============================================================================
+# Prior blocks unset -f'd real functions; re-source to restore the genuine
+# implementations before layering the protocol harness on top.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+SDIR="$PROJECTS/$(encode_path "$HOME")-code-p1"
+
+# -- Fake remote tools, driven by env vars. The REAL find_remote_pane script is
+# -- run locally by pointing a remote_sh stub at `bash -s` under a restricted
+# -- PATH containing ONLY these fakes plus the coreutils the script needs. This
+# -- exercises the ACTUAL protocol logic (tool detection, pgrep rc distinction,
+# -- ancestry walk, stable pane-id dedup), not a re-implementation of it.
+PANEBIN_BASE="$TMP/panebins"; mkdir -p "$PANEBIN_BASE"
+cat > "$TMP/fake_pgrep" <<'FEOF'
+#!/bin/bash
+[ -n "${FAKE_PGREP_OUT:-}" ] && printf '%s\n' $FAKE_PGREP_OUT
+exit "${FAKE_PGREP_RC:-0}"
+FEOF
+cat > "$TMP/fake_ps" <<'FEOF'
+#!/bin/bash
+[ "${FAKE_PS_RC:-0}" != 0 ] && exit "$FAKE_PS_RC"
+pid=""
+while [ $# -gt 0 ]; do case "$1" in -p) pid="$2"; shift 2 ;; *) shift ;; esac; done
+eval "v=\${FAKE_PPID_$pid:-}"
+[ -n "$v" ] && printf '   %s\n' "$v"
+exit 0
+FEOF
+cat > "$TMP/fake_tmux" <<'FEOF'
+#!/bin/bash
+case "${1:-}" in
+  list-panes) [ "${FAKE_TMUX_RC:-0}" != 0 ] && exit "$FAKE_TMUX_RC"
+              printf '%s\n' "${FAKE_PANES:-}"; exit 0 ;;
+  send-keys)  exit "${FAKE_SEND_RC:-0}" ;;
+  display-message) printf '%s\n' "${FAKE_SESSION:-}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+FEOF
+mk_panebin() {  # $1 = mode name ; remaining = fake tool basenames to install
+  local d="$PANEBIN_BASE/$1" t; shift
+  rm -rf "$d"; mkdir -p "$d"
+  for t in bash tr grep; do ln -sf "$(command -v "$t")" "$d/$t"; done
+  for t in "$@"; do cp "$TMP/fake_$t" "$d/$t"; chmod +x "$d/$t"; done
+  printf '%s' "$d"
+}
+export REMOTE=stub
+# remote_sh stub: pipe the payload into bash -s under the restricted PATH.
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
+
+# missing pgrep (the gateway tool) -> NOTOOLS, never NOPANE (M6b core fix)
+PANEBIN="$(mk_panebin notools_pgrep ps tmux)"
+assert_eq "protocol: missing pgrep -> NOTOOLS pgrep" "NOTOOLS pgrep" "$(find_remote_pane s1)"
+
+# pgrep present but the process is gone (rc 1) -> NOPANE
+PANEBIN="$(mk_panebin present pgrep ps tmux)"
+export FAKE_PGREP_RC=1 FAKE_PGREP_OUT=""
+assert_eq "protocol: pgrep rc1 -> NOPANE" "NOPANE" "$(find_remote_pane s1)"
+
+# pgrep present but ERRORS (rc>1) -> ERROR, never NOPANE (H3)
+export FAKE_PGREP_RC=2
+assert_eq "protocol: pgrep rc2 -> ERROR pgrep 2" "ERROR pgrep 2" "$(find_remote_pane s1)"
+unset FAKE_PGREP_RC
+
+# wrapper + child PIDs resolving to the SAME pane id dedup to one OK (H2)
+export FAKE_PGREP_RC=0 FAKE_PGREP_OUT="1000 1001"
+export FAKE_PPID_1000=900 FAKE_PPID_1001=900 FAKE_PPID_900=1
+export FAKE_PANES="900 %3"
+assert_eq "protocol: wrapper+child on one pane -> OK %3 (dedup)" "OK %3" "$(find_remote_pane s1)"
+
+# identity is the pane id, so an arbitrary/space-containing session name is
+# irrelevant: the same pid on a differently-named session still maps to its %id
+export FAKE_PANES="900 %7"
+assert_eq "protocol: pane id parsed regardless of session naming" "OK %7" "$(find_remote_pane s1)"
+
+# two DISTINCT panes -> AMBIGUOUS (never a false OK) (H2/FM3)
+export FAKE_PGREP_OUT="1000 2000"
+export FAKE_PPID_1000=900 FAKE_PPID_2000=800 FAKE_PPID_800=1
+export FAKE_PANES=$'900 %3\n800 %4'
+assert_eq "protocol: two panes -> AMBIGUOUS %3 %4" "AMBIGUOUS %3 %4" "$(find_remote_pane s1)"
+
+# a match whose ancestry never reaches a tmux pane -> NOTMUX
+export FAKE_PGREP_OUT="1000"
+export FAKE_PPID_1000=900 FAKE_PPID_900=1
+export FAKE_PANES="700 %9"
+assert_eq "protocol: match outside tmux -> NOTMUX" "NOTMUX" "$(find_remote_pane s1)"
+
+# tmux missing once a match exists -> NOTOOLS tmux (H3/M6b)
+PANEBIN="$(mk_panebin notools_tmux pgrep ps)"
+assert_eq "protocol: match but no tmux -> NOTOOLS tmux" "NOTOOLS tmux" "$(find_remote_pane s1)"
+
+# tmux present but list-panes fails at runtime -> ERROR tmux (H3)
+PANEBIN="$(mk_panebin err_tmux pgrep ps tmux)"
+export FAKE_TMUX_RC=3
+assert_eq "protocol: tmux list-panes error -> ERROR tmux 3" "ERROR tmux 3" "$(find_remote_pane s1)"
+unset FAKE_TMUX_RC FAKE_PGREP_OUT FAKE_PGREP_RC FAKE_PANES
+unset -f remote_sh
+unset REMOTE
+
+# -- Caller reactions: handoff AND handback must REFUSE before ANY stop on
+# -- every ambiguous / unverifiable state (the writer may still be running).
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+RSTOP="$TMP/refuse_stop"
+STATE=""
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/refuse.jsonl"; }
+find_remote_pane() { printf '%s' "$STATE"; }
+stop_remote_claude() { echo stop >> "$RSTOP"; }
+for STATE in "AMBIGUOUS %3 %4" "NOTMUX" "NOTOOLS pgrep" "ERROR pgrep 2"; do
+  word="${STATE%% *}"
+  : > "$RSTOP"
+  rc=0; out="$( (cmd_handoff refuse) 2>&1 )" || rc=$?
+  assert_rc "handoff refuses $word before stop" 1 "$rc"
+  assert_eq "handoff did not stop on $word" "" "$(cat "$RSTOP")"
+  assert_match "handoff $word refusal says NOT stopped" "NOT stopped" "$out"
+  : > "$RSTOP"
+  rc=0; out="$( (cmd_handback refuse) 2>&1 )" || rc=$?
+  assert_rc "handback refuses $word before stop" 1 "$rc"
+  assert_eq "handback did not stop on $word" "" "$(cat "$RSTOP")"
+  assert_match "handback $word refusal says NOT stopped" "NOT stopped" "$out"
+done
+unset -f require_remote find_remote_session find_remote_pane stop_remote_claude
+
+# -- handoff --no-stop: skips discovery, stop, AND restart; still pushes.
+NSCALLS="$TMP/nostop_calls"; : > "$NSCALLS"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+find_remote_pane() { echo pane-lookup >> "$NSCALLS"; printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'local-newer'; }
+stop_remote_claude() { echo stop >> "$NSCALLS"; }
+cmd_push() { echo push >> "$NSCALLS"; }
+cmd_repo_pull() { :; }
+cmd_sync_extras() { :; }
+restart_remote_claude() { echo restart >> "$NSCALLS"; }
+session_cwd_local() { printf '%s' "$HOME/code/p1"; }
+NO_STOP=1; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handoff bbb) 2>&1 )" || rc=$?
+assert_rc "handoff --no-stop succeeds" 0 "$rc"
+assert_eq "handoff --no-stop skips discovery+stop+restart (push only)" \
+  "push" "$(tr '\n' ' ' < "$NSCALLS" | sed 's/ *$//')"
+assert_match "handoff --no-stop prints a manual start hint" "claude --resume" "$out"
+unset -f require_remote find_local_session find_remote_pane compare_mtimes \
+  stop_remote_claude cmd_push cmd_repo_pull cmd_sync_extras restart_remote_claude session_cwd_local
+NO_STOP=0
+
+# ============================================================================
+# H5 commit 2: arm-before-stop, state-aware recovery, handback pull-window trap
+# ============================================================================
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+PROJECTS="$TMP/projects"
+SDIR="$PROJECTS/$(encode_path "$HOME")-code-p1"
+ho_stubs() {  # the shared handoff happy-path stub set
+  require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+  find_local_session() { printf '%s' "$SDIR/bbb.jsonl"; }
+  find_remote_pane() { printf '%s' 'OK %1'; }
+  compare_mtimes() { printf 'local-newer'; }
+  cmd_push() { echo push >> "$C2"; }
+  cmd_repo_pull() { echo repopull >> "$C2"; }
+  cmd_sync_extras() { echo extras >> "$C2"; }
+  session_cwd_local() { printf '%s' "$HOME/code/p1"; }
+}
+ho_unstub() { unset -f require_remote find_local_session find_remote_pane compare_mtimes \
+  cmd_push cmd_repo_pull cmd_sync_extras session_cwd_local stop_remote_claude \
+  restart_remote_claude _recover_remote_op; }
+
+# -- (A) H1 recovery matrix at the decision layer: _recover_restart must type
+# -- into the pane ONLY when the op positively reports RESTARTED (i.e. the
+# -- remote confirmed nothing was running and already restarted it). Every
+# -- other outcome -> a manual hint, never a blind restart.
+export REMOTE=stub
+OP_OUT=""; OP_RC=0
+_recover_remote_op() { printf '%s' "$OP_OUT"; return "$OP_RC"; }
+# spec: <op-output>|<needle in log>|<restarted? yes/no>   (OP_RC=0 for all)
+for spec in \
+  "RESTARTED|restarted it|yes" \
+  "RUNNING|still running|no" \
+  "ERROR 2|NOT restarting|no" \
+  "NOTOOLS|NOT restarting|no" \
+  "NOPANEID|no longer exists|no" \
+  "SENDFAIL|send-keys failed|no" \
+  "|unexpected|no" \
+  "WEIRD|unexpected|no"; do
+  OP_OUT="${spec%%|*}"; rest="${spec#*|}"; needle="${rest%%|*}"; want="${rest#*|}"
+  OP_RC=0
+  out="$(_recover_restart sess %1 2>&1)"
+  label="${OP_OUT:-<empty>}"
+  assert_match "recover($label): logs '$needle'" "$needle" "$out"
+  case "$out" in *"restarted it"*) got=yes ;; *) got=no ;; esac
+  assert_eq "recover($label): restart=$want" "$want" "$got"
+done
+# ssh/transport failure (op returns nonzero) -> no restart, manual hint
+OP_OUT="RESTARTED"; OP_RC=255
+out="$(_recover_restart sess %1 2>&1)"
+assert_match "recover(ssh-fail): manual hint" "manual recovery" "$out"
+case "$out" in *"restarted it"*) t_fail "recover(ssh-fail): must NOT restart" "$out" ;; *) t_ok "recover(ssh-fail): no restart" ;; esac
+unset -f _recover_remote_op
+unset OP_OUT OP_RC REMOTE
+
+# -- (B) _recover_remote_op at the SCRIPT level: restart happens exactly once
+# -- and ONLY when pgrep confirms no match, rechecked immediately before the
+# -- send-keys (the probe/restart race narrowed to one op). A send-keys log
+# -- records any type into the pane. (Block A unset -f'd the real op; re-source
+# -- to restore the genuine implementation before running it for real.)
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+cat > "$TMP/fake_tmux" <<'FEOF'
+#!/bin/bash
+case "${1:-}" in
+  list-panes) [ "${FAKE_TMUX_RC:-0}" != 0 ] && exit "$FAKE_TMUX_RC"
+              printf '%s\n' "${FAKE_PANES:-}"; exit 0 ;;
+  send-keys)  [ -n "${FAKE_SEND_LOG:-}" ] && echo "send $*" >> "$FAKE_SEND_LOG"
+              exit "${FAKE_SEND_RC:-0}" ;;
+  display-message) printf '%s\n' "${FAKE_SESSION:-}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+FEOF
+export REMOTE=stub
+export FAKE_SEND_LOG="$TMP/sendlog"
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
+PANEBIN="$(mk_panebin recov pgrep ps tmux)"
+
+# no match + pane present -> RESTARTED, exactly one send-keys
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%1"
+assert_eq "op: no match + pane -> RESTARTED" "RESTARTED" "$(_recover_remote_op sess %1)"
+assert_eq "op: RESTARTED typed exactly once" "1" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+
+# a matching process is present -> RUNNING, NO send-keys (idempotent / FM5;
+# the recheck-before-type that narrows the probe->restart race, H4)
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=0 FAKE_PGREP_OUT="1234"
+assert_eq "op: match present -> RUNNING" "RUNNING" "$(_recover_remote_op sess %1)"
+assert_eq "op: RUNNING never types into the pane" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+
+# pgrep errors -> ERROR, never restart (H3)
+export FAKE_PGREP_RC=2
+: > "$FAKE_SEND_LOG"
+assert_eq "op: pgrep error -> ERROR 2" "ERROR 2" "$(_recover_remote_op sess %1)"
+assert_eq "op: ERROR never types" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+
+# no match but the stored pane id is gone/reused -> NOPANEID, no send-keys
+export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%2"
+: > "$FAKE_SEND_LOG"
+assert_eq "op: missing pane id -> NOPANEID" "NOPANEID" "$(_recover_remote_op sess %1)"
+assert_eq "op: NOPANEID never types" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG
+unset -f remote_sh; unset REMOTE
+
+# -- (C) arm-before-stop (FM1): a failure DURING the stop (before any transfer)
+# -- must still reach recovery, and the original exit code is preserved.
+C2="$TMP/c2_abs"; : > "$C2"
+ho_stubs
+stop_remote_claude() { echo stop >> "$C2"; exit 7; }   # dies mid-stop
+_recover_remote_op() { echo op-restart >> "$C2"; printf RESTARTED; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; (cmd_handoff bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "arm-before-stop: exit code from a failed stop is preserved" 7 "$rc"
+assert_match "arm-before-stop: recovery ran despite failure during stop" "op-restart" "$(cat "$C2")"
+assert_eq "arm-before-stop: nothing was transferred" "" "$(grep push "$C2" || true)"
+ho_unstub
+
+# -- (D) exit-code preservation + single-fire: a failure AFTER the stop fires
+# -- recovery exactly once and preserves the code.
+C2="$TMP/c2_sf"; : > "$C2"
+ho_stubs
+stop_remote_claude() { echo stop >> "$C2"; }
+cmd_repo_pull() { return 7; }
+_recover_remote_op() { echo op >> "$C2"; printf RESTARTED; }
+rc=0; (cmd_handoff bbb) >/dev/null 2>&1 || rc=$?
+assert_rc "recovery preserves the original exit code (7)" 7 "$rc"
+assert_eq "recovery fired exactly once (single-fire)" "1" "$(grep -c '^op$' "$C2")"
+ho_unstub
+
+# -- (E) restart half-success then probe OK does NOT type twice: the happy-path
+# -- send-keys returns nonzero but claude actually started; the trap re-checks,
+# -- sees RUNNING, and does not restart again.
+C2="$TMP/c2_half"; : > "$C2"
+ho_stubs
+stop_remote_claude() { echo stop >> "$C2"; }
+restart_remote_claude() { echo happy-restart >> "$C2"; return 1; }   # half-success
+_recover_remote_op() { echo probe >> "$C2"; printf RUNNING; }
+rc=0; out="$( (cmd_handoff bbb) 2>&1 )" || rc=$?
+assert_rc "half-success restart exits nonzero" 1 "$rc"
+assert_eq "happy-path restart attempted once" "1" "$(grep -c '^happy-restart$' "$C2")"
+assert_eq "recovery probed once" "1" "$(grep -c '^probe$' "$C2")"
+assert_match "recovery saw it already running (no second type)" "still running" "$out"
+ho_unstub
+
+# -- (F) handback pre-pull failure recovers the remote; no local-resume hint.
+HBF="$TMP/c2_hbf"; : > "$HBF"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/hbf.jsonl"; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$HBF"; }
+cmd_pull() { echo pull >> "$HBF"; return 9; }
+_recover_remote_op() { echo op-restart >> "$HBF"; printf RESTARTED; }
+NO_STOP=0; NO_EXTRAS=1; FORCE=0
+rc=0; out="$( (cmd_handback hbf) 2>&1 )" || rc=$?
+assert_rc "handback pull failure propagates (9)" 9 "$rc"
+assert_match "handback pull failure triggers recovery restart" "op-restart" "$(cat "$HBF")"
+case "$out" in *"resume locally"*) t_fail "no resume hint after a failed pull" "$out" ;; *) t_ok "no resume hint after a failed pull" ;; esac
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes stop_remote_claude cmd_pull _recover_remote_op
+
+# -- (G) --no-extras does NOT disable pull-window recovery (F ran with
+# -- NO_EXTRAS=1). And handback --no-stop performs NO recovery on pull failure.
+NSB="$TMP/c2_nsb"; : > "$NSB"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/nsb.jsonl"; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$NSB"; }
+cmd_pull() { echo pull >> "$NSB"; return 4; }
+_recover_remote_op() { echo op >> "$NSB"; printf RESTARTED; }
+NO_STOP=1; NO_EXTRAS=1; FORCE=0
+rc=0; (cmd_handback nsb) >/dev/null 2>&1 || rc=$?
+assert_rc "handback --no-stop pull failure propagates (4)" 4 "$rc"
+assert_eq "handback --no-stop never stops" "" "$(grep stop "$NSB" || true)"
+assert_eq "handback --no-stop performs NO recovery" "" "$(grep '^op$' "$NSB" || true)"
+unset -f require_remote find_remote_session compare_mtimes stop_remote_claude cmd_pull _recover_remote_op
+NO_STOP=0
+
+# -- (H) no restart after a SUCCESSFUL pull, even when extras hard-exits: the
+# -- trap is disarmed once the pull confirms local, so a later failure never
+# -- recreates a dual writer. (Mirrors the D2-belt cwd setup.)
+NRF="$TMP/c2_nrf"; : > "$NRF"
+require_remote() { REMOTE=stub; RHOME=/home/alice; RPROJECTS=/home/alice/.claude/projects; }
+find_remote_session() { printf '%s' "/home/alice/.claude/projects/-home-alice-code-my-app/nrf.jsonl"; }
+find_remote_pane() { printf '%s' 'OK %1'; }
+compare_mtimes() { printf 'remote-newer'; }
+stop_remote_claude() { echo stop >> "$NRF"; }
+cmd_pull() { echo pull >> "$NRF"; }
+remote_sh() { printf '/home/alice/code/my-app\n'; }   # cwd extractor for step 2b
+cmd_sync_extras() { echo extras >> "$NRF"; exit 5; }   # hard exit in the extras subshell
+_recover_remote_op() { echo op-restart >> "$NRF"; printf RESTARTED; }
+NO_STOP=0; NO_EXTRAS=0; FORCE=0
+rc=0; out="$( (cmd_handback nrf) 2>&1 )" || rc=$?
+assert_rc "handback extras failure after a good pull returns extras rc (5)" 5 "$rc"
+assert_match "handback still prints the local-resume hint" "resume locally" "$out"
+assert_eq "NO recovery restart after a successful pull" "" "$(grep op-restart "$NRF" || true)"
+unset -f require_remote find_remote_session find_remote_pane compare_mtimes \
+  stop_remote_claude cmd_pull remote_sh cmd_sync_extras _recover_remote_op
+
+# -- (I) stop_remote_claude classifies its exit: 255 (disconnect) vs 1
+# -- (timeout) vs 2 (pgrep error) get distinct, accurate messages. Prior
+# -- blocks unset -f'd the real stop_remote_claude; re-source to restore it.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+export REMOTE=myhost
+remote_sh() { return 255; }
+rc=0; out="$( (stop_remote_claude sess %1) 2>&1 )" || rc=$?
+assert_rc "stop dies on ssh disconnect" 1 "$rc"
+assert_match "stop 255 -> disconnect/unknown message" "disconnected" "$out"
+remote_sh() { return 1; }
+out="$( (stop_remote_claude sess %1) 2>&1 )" || true
+assert_match "stop 1 -> timeout message" "did not exit after 10s" "$out"
+remote_sh() { return 2; }
+out="$( (stop_remote_claude sess %1) 2>&1 )" || true
+assert_match "stop 2 -> pgrep-error/unknown message" "pgrep errored" "$out"
+unset -f remote_sh; unset REMOTE
+
+# ============================================================================
+# H5 nit: _recover_remote_op's tool check must include grep
+# ============================================================================
+# The op's pane-existence check pipes `tmux list-panes` through grep; without
+# a grep presence check a grep-less remote would misreport NOPANEID. It must
+# answer NOTOOLS ("cannot verify") instead — and never type into the pane.
+# shellcheck disable=SC1090
+. "$REPO_DIR/bin/claude-roam"
+export REMOTE=stub
+export FAKE_SEND_LOG="$TMP/sendlog_nogrep"
+remote_sh() { local s="$1"; shift; printf '%s' "$s" | PATH="$PANEBIN" bash -s -- "$@"; }
+PANEBIN="$(mk_panebin recov_nogrep pgrep ps tmux)"
+rm -f "$PANEBIN/grep"
+: > "$FAKE_SEND_LOG"; export FAKE_PGREP_RC=1 FAKE_PGREP_OUT="" FAKE_PANES="%1"
+assert_eq "op: no match + grep missing -> NOTOOLS (not NOPANEID)" "NOTOOLS" "$(_recover_remote_op sess %1)"
+assert_eq "op: grep-missing NOTOOLS never types" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+# decision layer on top of the same grep-less remote: "cannot verify" + manual
+# hint, no restart.
+out="$(_recover_restart sess %1 2>&1)"
+assert_match "recover(no-grep): cannot-verify message" "cannot verify" "$out"
+assert_match "recover(no-grep): manual hint" "manual recovery" "$out"
+assert_eq "recover(no-grep): never types into the pane" "0" "$(grep -c '^send' "$FAKE_SEND_LOG")"
+unset FAKE_PGREP_RC FAKE_PGREP_OUT FAKE_PANES FAKE_SEND_LOG
+unset -f remote_sh; unset REMOTE
 
 t_summary
