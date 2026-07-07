@@ -41,7 +41,7 @@ out to the other machine — see [hub-and-spoke](#honest-limits) below).
 
 ```bash
 # 1. Get the code and install (the CLI + the Claude Code skill that teaches it)
-git clone https://github.com/<you>/claude-roam ~/code/claude-roam
+git clone https://github.com/bclement14/claude-roam ~/code/claude-roam
 cd ~/code/claude-roam
 ./install.sh
 

@@ -3014,4 +3014,90 @@ rc=0; (_resolve_cwd_candidate "/evil/kt_playground/ft" "$LHP-kt-playground-ft" "
 assert_rc "claude_norm: foreign root still refused by resolver" 1 "$rc"
 REMOTE=""; RHOME=""; RHOME_PHYS=""
 
+# ---- C2: config ownership/permission hardening (review hardening) ----
+# The config is sourced as shell (load_config's ". $cfg"), so a file another
+# user or group could edit must never be sourced silently — hardened like
+# ssh's StrictModes. Uses a dedicated XDG root, isolated from every other
+# config fixture in this file.
+C2_XDG="$TMP/c2xdg"; mkdir -p "$C2_XDG/claude-roam"
+C2_CFG="$C2_XDG/claude-roam/config"
+printf 'CLAUDE_ROAM_REMOTE=shouldnotload\n' > "$C2_CFG"
+
+chmod 666 "$C2_CFG"
+rc=0; out="$(env -i HOME="$HOME" XDG_CONFIG_HOME="$C2_XDG" PATH="$PATH" \
+  bash -c ". '$REPO_DIR/bin/claude-roam'; load_config" 2>&1)" || rc=$?
+assert_rc "C2: load_config refuses a mode-666 (group+other writable) config" 1 "$rc"
+assert_match "C2: mode-666 refusal points at the chmod fix" "chmod go-w" "$out"
+assert_match "C2: mode-666 refusal reports the mode" "mode 666" "$out"
+
+chmod 664 "$C2_CFG"
+rc=0; out="$(env -i HOME="$HOME" XDG_CONFIG_HOME="$C2_XDG" PATH="$PATH" \
+  bash -c ". '$REPO_DIR/bin/claude-roam'; load_config" 2>&1)" || rc=$?
+assert_rc "C2: load_config refuses a mode-664 (group-writable only) config" 1 "$rc"
+assert_match "C2: mode-664 refusal points at the chmod fix" "chmod go-w" "$out"
+
+# A normal, non-group/other-writable config (the default-umask 022 -> 644
+# case that every other fixture in this file already produces) must still
+# source fine.
+chmod 600 "$C2_CFG"
+assert_eq "C2: load_config sources a mode-600 config" "shouldnotload" \
+  "$(env -i HOME="$HOME" XDG_CONFIG_HOME="$C2_XDG" PATH="$PATH" \
+     bash -c ". '$REPO_DIR/bin/claude-roam'; load_config; printf %s \"\$CLAUDE_ROAM_REMOTE\"")"
+
+chmod 644 "$C2_CFG"
+assert_eq "C2: load_config sources a mode-644 config (default-umask case)" "shouldnotload" \
+  "$(env -i HOME="$HOME" XDG_CONFIG_HOME="$C2_XDG" PATH="$PATH" \
+     bash -c ". '$REPO_DIR/bin/claude-roam'; load_config; printf %s \"\$CLAUDE_ROAM_REMOTE\"")"
+
+# Foreign ownership: root is unavailable in CI/dev, so the only way to
+# exercise the ownership branch without it is to shadow `id` with a function
+# that reports a uid which can never equal the fixture's real owner.
+rc=0; out="$(env -i HOME="$HOME" XDG_CONFIG_HOME="$C2_XDG" PATH="$PATH" \
+  bash -c "id() { printf 99999; }; . '$REPO_DIR/bin/claude-roam'; load_config" 2>&1)" || rc=$?
+assert_rc "C2: load_config refuses a config owned by a different uid" 1 "$rc"
+assert_match "C2: foreign-owner refusal names the reason" "not owned by you" "$out"
+
+rm -rf "$C2_XDG"
+
+# ---- C3: doctor format-drift canary (review hardening) ----
+# Claude Code encodes every project dir name with a leading '-'
+# (encode_path). If ~/.claude/projects has entries but NONE look encoded,
+# either this isn't Claude Code's projects dir or the layout drifted —
+# either way claude-roam's dir-name assumptions may no longer hold. Uses
+# dedicated PROJECTS roots so this never disturbs $TMP/projects, which
+# earlier tasks' fixtures still rely on.
+REMOTE_FLAG=""; CLAUDE_ROAM_REMOTE=""
+
+C3_ONLY="$TMP/c3-projects-driftonly"; mkdir -p "$C3_ONLY/not-encoded-at-all"
+PROJECTS="$C3_ONLY"
+out="$(cmd_doctor 2>&1)" || true
+assert_match "C3: warns when no child dir looks encoded" \
+  "none look like encoded project dirs" "$out"
+
+C3_ENC="$TMP/c3-projects-withencoded"; mkdir -p "$C3_ENC/-Users-alice-code-app"
+PROJECTS="$C3_ENC"
+out="$(cmd_doctor 2>&1)" || true
+case "$out" in
+  *"none look like encoded project dirs"*) t_fail "C3: no drift-warn when a '-'-prefixed dir exists" "output: $out" ;;
+  *) t_ok "C3: no drift-warn when a '-'-prefixed dir exists" ;;
+esac
+
+C3_EMPTY="$TMP/c3-projects-empty"; mkdir -p "$C3_EMPTY"
+PROJECTS="$C3_EMPTY"
+out="$(cmd_doctor 2>&1)" || true
+case "$out" in
+  *"none look like encoded project dirs"*) t_fail "C3: no drift-warn for an empty projects dir" "output: $out" ;;
+  *) t_ok "C3: no drift-warn for an empty projects dir" ;;
+esac
+
+C3_MIXED="$TMP/c3-projects-mixed"; mkdir -p "$C3_MIXED/-Users-alice-code-app" "$C3_MIXED/scratch"
+PROJECTS="$C3_MIXED"
+out="$(cmd_doctor 2>&1)" || true
+case "$out" in
+  *"none look like encoded project dirs"*) t_fail "C3: no drift-warn when an encoded dir sits alongside a non-encoded one" "output: $out" ;;
+  *) t_ok "C3: no drift-warn when an encoded dir sits alongside a non-encoded one" ;;
+esac
+
+PROJECTS="$TMP/projects"   # restore in case anything is appended after this line
+
 t_summary

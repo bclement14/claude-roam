@@ -101,6 +101,33 @@ validate_remote_alias() {
   esac
 }
 
+# The config is executable shell: harden it like ssh's StrictModes BEFORE
+# it is ever sourced. Refuses (dies) when the file is not owned by the
+# current user, or is writable by group or other — a config an attacker
+# (or a shared/misconfigured dir) could edit must never be silently
+# executed as this user. A stat failure (unreadable, race, exotic stat
+# variant) also fails closed rather than proceeding to source it.
+_check_config_perms() {
+  local f="$1" uid perm
+  uid="$(stat -c %u "$f" 2>/dev/null || stat -f %u "$f" 2>/dev/null)"
+  if [ -z "$uid" ]; then
+    die "could not stat config $f (unreadable or race); refusing to source it"
+  fi
+  if [ "$uid" != "$(id -u)" ]; then
+    die "config $f is not owned by you (uid $uid); refusing to source it"
+  fi
+  perm="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
+  if [ -z "$perm" ]; then
+    die "could not read permissions for config $f; refusing to source it"
+  fi
+  case "$perm" in
+    *[!0-7]*) die "could not parse permissions for config $f (got '$perm'); refusing to source it" ;;
+  esac
+  if [ $(( 8#$perm & 8#022 )) -ne 0 ]; then
+    die "config $f is writable by group/other (mode $perm); run: chmod go-w $f"
+  fi
+}
+
 load_config() {
   # Capture env BEFORE sourcing config so env beats config. Empty == unset.
   local env_remote="${CLAUDE_ROAM_REMOTE:-}"
@@ -118,6 +145,7 @@ load_config() {
   # The config is executable shell: protect it like a shell rc file.
   local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/claude-roam/config"
   if [ -f "$cfg" ]; then
+    _check_config_perms "$cfg"
     # shellcheck disable=SC1090
     . "$cfg"
   fi
@@ -2255,7 +2283,29 @@ cmd_doctor() {
   local rsync_ver
   rsync_ver="$(rsync --version 2>/dev/null | head -1)"
   if [ -n "$rsync_ver" ]; then log "     rsync: $rsync_ver"; fi
-  if [ -d "$PROJECTS" ]; then _dr_ok "projects dir $PROJECTS"; else _dr_warn "projects dir missing: $PROJECTS (run Claude Code once)"; fi
+  if [ -d "$PROJECTS" ]; then
+    _dr_ok "projects dir $PROJECTS"
+    # Format-drift canary: Claude Code encodes every project dir name with a
+    # leading '-' (encode_path). If the dir has entries but NONE of them look
+    # encoded, either this tree isn't Claude Code's projects dir or Claude
+    # Code changed its layout — either way claude-roam's dir-name assumptions
+    # may no longer hold. Read-only; says nothing when missing/empty or when
+    # at least one '-'-prefixed child exists.
+    local _pd _has_child=0 _has_encoded=0
+    for _pd in "$PROJECTS"/*/; do
+      [ -d "$_pd" ] || continue
+      _has_child=1
+      case "$(basename "$_pd")" in
+        -*) _has_encoded=1; break ;;
+      esac
+    done
+    if [ "$_has_child" -eq 1 ] && [ "$_has_encoded" -eq 0 ]; then
+      # shellcheck disable=SC2088  # literal display text, not an unexpanded path
+      _dr_warn "~/.claude/projects has entries but none look like encoded project dirs — claude-roam may be out of date with Claude Code's session layout"
+    fi
+  else
+    _dr_warn "projects dir missing: $PROJECTS (run Claude Code once)"
+  fi
   # Physical-home detection status (set by main; empty when sourced).
   if [ "${LHOME_PHYS_FALLBACK:-0}" -eq 1 ]; then
     _dr_warn "local physical-home probe failed — assuming physical == logical ($HOME)"

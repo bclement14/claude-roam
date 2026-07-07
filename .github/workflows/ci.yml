@@ -27,3 +27,46 @@ jobs:
         run: |
           /bin/bash -c 'echo "bash: $BASH_VERSION"; [ "${BASH_VERSINFO[0]}" -eq 3 ]'
           /bin/bash test/unit.sh
+  smoke-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: set up passwordless loopback ssh
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server rsync
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys ~/.ssh/id_ed25519
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+          sudo systemctl start ssh
+          ok=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "passwordless ssh to localhost did not come up in time"
+            exit 1
+          fi
+          echo "passwordless ssh localhost is ready"
+      - name: smoke test (real ssh/rsync loopback transport)
+        run: |
+          set +e
+          out="$(bash test/smoke.sh)"
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ]; then
+            echo "smoke.sh exited non-zero ($rc)"
+            exit 1
+          fi
+          if ! printf '%s\n' "$out" | grep -q "SMOKE PASSED"; then
+            echo "smoke.sh did not report SMOKE PASSED (it may have SKIPped) -- failing: this job exists to exercise real transport"
+            exit 1
+          fi
